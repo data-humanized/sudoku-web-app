@@ -5,7 +5,7 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
-    base : '/Sudoku-web-app/',
+    base : '/sudoku-web-app/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
