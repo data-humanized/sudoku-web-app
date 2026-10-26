@@ -1,0 +1,6 @@
+{
+  "name": "ZenSudoku - Minimalist Sudoku Desktop",
+  "description": "A minimalist, distraction-free desktop Sudoku app featuring pure logic engine, progressive unlock levels, daily streaks, and clean slate aesthetic.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
