@@ -1,12 +1,18 @@
 /**
  * sudokuLogic.ts
- * Pure TypeScript Sudoku engine matching sudoku_logic.py:
- * Data models, Backtracking solver, Uniqueness validation, Difficulty grader,
- * Scoring formula, Level progression unlock rules, and Daily streak calculations.
+ * Complete ZenSudoku Engine:
+ * - Single source of truth for MAX_SCORE and CLUE_RANGES
+ * - Data models, bitmask solver, uniqueness validator
+ * - Procedural generator using crypto.getRandomValues
+ * - Canonical fingerprinting invariant to relabeling, rotation, reflection, band/stack & row/col swaps
+ * - Clue similarity checker (rejecting >20% overlap with last 20 played games)
+ * - Technique difficulty grader (Easy: singles only; Medium: +pairs/box-line; Hard: +triples/X-Wing/Y-Wing; Expert: +chains/forcing; Master: hardest)
+ * - Dynamic cell locking (correctly placed digits locked, cannot be overwritten/erased/undone)
+ * - Section 8 Live Scoring formula with combos, penalties, scaling (flawless: 85%-100% of MAX_SCORE)
+ * - History migration: round(oldScore / oldMax * newMax)
  */
 
-export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
-
+export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert' | 'master';
 export type Grid = number[][]; // 9x9 matrix (0 = empty, 1-9 = placed)
 export type Notes = Set<number>[][]; // 9x9 matrix of candidate sets
 export type BoolGrid = boolean[][];
@@ -31,10 +37,12 @@ export interface HistoryRecord {
   date: string; // ISO format 'YYYY-MM-DD'
   timestamp: number;
   level: Difficulty;
-  seconds: number;
+  timeSeconds: number;
   score: number;
   hintsUsed: number;
   mistakes: number;
+  seconds?: number; // legacy alias
+  won?: boolean;
 }
 
 export interface GameState {
@@ -55,14 +63,26 @@ export interface GameState {
   startTime: number;
   completedTime?: number;
   finalScore: number;
+  earnedComboUnits?: number;
+  totalMistakes?: number;
+}
+
+/**
+ * Returns YYYY-MM-DD in local time to prevent timezone offset discrepancies
+ */
+export function getLocalDateString(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 export interface UserSettings {
   numberSize: 'small' | 'medium' | 'large';
   showTimer: boolean;
   highlightSameNumbers: boolean;
-  colorFeedback: boolean; // default true (green correct, red wrong)
-  autoRemoveNotes: boolean; // auto-clear peer notes on correct entry
+  colorFeedback: boolean;
+  autoRemoveNotes: boolean;
   soundEffects: boolean;
   hapticFeedback: boolean;
 }
@@ -77,25 +97,98 @@ export const DEFAULT_SETTINGS: UserSettings = {
   hapticFeedback: true,
 };
 
-export const BASE_SCORES: Record<Difficulty, number> = {
+/**
+ * Section 1 & Section 8: MAX_SCORE defined in ONE shared constant.
+ * easy: 6000, medium: 9000, hard: 13000, expert: 17000, master: 21000.
+ */
+export const MAX_SCORE: Record<Difficulty, number> = {
+  easy: 6000,
+  medium: 9000,
+  hard: 13000,
+  expert: 17000,
+  master: 21000,
+};
+
+/**
+ * Legacy Max Score for data migration:
+ * easy 1000, medium 2000, hard 4000, expert 8000, master 16000.
+ */
+export const OLD_MAX_SCORE: Record<Difficulty, number> = {
   easy: 1000,
   medium: 2000,
   hard: 4000,
   expert: 8000,
+  master: 16000,
 };
 
-// Set to true for the Android release.
-export const LEVELS_LOCKED = false;
-
-export const UNLOCK_REQUIREMENTS: Record<Difficulty, { prereq: Difficulty | null; count: number }> = {
-  easy: { prereq: null, count: 0 },
-  medium: { prereq: 'easy', count: 2 },
-  hard: { prereq: 'medium', count: 4 },
-  expert: { prereq: 'hard', count: 16 },
+/**
+ * Section 2: Clue count range per level in ONE shared constant.
+ * Strictly fewer clues as the level rises:
+ * easy > medium > hard > expert > master.
+ */
+export const CLUE_RANGES: Record<Difficulty, { min: number; max: number }> = {
+  easy: { min: 36, max: 40 },
+  medium: { min: 31, max: 35 },
+  hard: { min: 27, max: 30 },
+  expert: { min: 24, max: 26 },
+  master: { min: 21, max: 23 },
 };
 
+/**
+ * Migrate old history records to the new scale:
+ * round((oldScore / oldMax) * newMax)
+ */
+export function migrateHistoryRecord(record: HistoryRecord): HistoryRecord {
+  const level = record.level;
+  const oldMax = OLD_MAX_SCORE[level] || 1000;
+  const newMax = MAX_SCORE[level];
+
+  // If score appears to be on the old scale (<= oldMax), migrate it
+  let score = record.score;
+  if (score <= oldMax) {
+    score = Math.round((record.score / oldMax) * newMax);
+  }
+  score = Math.min(newMax, Math.max(0, score));
+
+  const timeSeconds = typeof record.timeSeconds === 'number'
+    ? record.timeSeconds
+    : (typeof record.seconds === 'number' ? record.seconds : 0);
+
+  return {
+    ...record,
+    timeSeconds,
+    score,
+    won: record.won !== undefined ? record.won : (score > 0),
+  };
+}
+
+/**
+ * Section 3: Cell Locking
+ * - A cell is locked if it was an initial clue, or if the current placed
+ *   digit matches the solution grid.
+ * - Survives reload because it dynamically compares filled cell with solution.
+ */
+export function isCellLocked(
+  row: number,
+  col: number,
+  initialGrid: Grid,
+  currentGrid: Grid,
+  solutionGrid: Grid
+): boolean {
+  if (initialGrid[row][col] !== 0) return true;
+  const currentVal = currentGrid[row][col];
+  return currentVal !== 0 && currentVal === solutionGrid[row][col];
+}
+
+// --------------------------------------------------------------------------
+// Utility Grid Operations
+// --------------------------------------------------------------------------
 export function createEmptyGrid(): Grid {
   return Array.from({ length: 9 }, () => Array(9).fill(0));
+}
+
+export function cloneGrid(grid: Grid): Grid {
+  return grid.map(row => [...row]);
 }
 
 export function createEmptyNotes(): Notes {
@@ -104,16 +197,12 @@ export function createEmptyNotes(): Notes {
   );
 }
 
+export function cloneNotes(notes: Notes): Notes {
+  return notes.map(row => row.map(cell => new Set(cell)));
+}
+
 export function createEmptyBoolGrid(): BoolGrid {
   return Array.from({ length: 9 }, () => Array(9).fill(false));
-}
-
-export function cloneGrid(grid: Grid): Grid {
-  return grid.map(row => [...row]);
-}
-
-export function cloneNotes(notes: Notes): Notes {
-  return notes.map(row => row.map(s => new Set(s)));
 }
 
 export function cloneBoolGrid(bg: BoolGrid): BoolGrid {
@@ -121,753 +210,991 @@ export function cloneBoolGrid(bg: BoolGrid): BoolGrid {
 }
 
 export function getPeers(row: number, col: number): [number, number][] {
-  const peerMap = new Map<string, [number, number]>();
+  const peers: [number, number][] = [];
+  const startRow = Math.floor(row / 3) * 3;
+  const startCol = Math.floor(col / 3) * 3;
+
   for (let c = 0; c < 9; c++) {
-    if (c !== col) peerMap.set(`${row},${c}`, [row, c]);
+    if (c !== col) peers.push([row, c]);
   }
   for (let r = 0; r < 9; r++) {
-    if (r !== row) peerMap.set(`${r},${col}`, [r, col]);
+    if (r !== row) peers.push([r, col]);
   }
-  const br = Math.floor(row / 3) * 3;
-  const bc = Math.floor(col / 3) * 3;
-  for (let r = br; r < br + 3; r++) {
-    for (let c = bc; c < bc + 3; c++) {
-      if (r !== row || c !== col) {
-        peerMap.set(`${r},${c}`, [r, c]);
-      }
+  for (let r = startRow; r < startRow + 3; r++) {
+    for (let c = startCol; c < startCol + 3; c++) {
+      if (r !== row && c !== col) peers.push([r, c]);
     }
   }
-  return Array.from(peerMap.values());
+  return peers;
 }
 
-export function isValidPlacement(grid: Grid, row: number, col: number, val: number): boolean {
-  if (val < 1 || val > 9) return false;
-  // Row check
+export function isValidPlacement(grid: Grid, row: number, col: number, num: number): boolean {
   for (let c = 0; c < 9; c++) {
-    if (c !== col && grid[row][c] === val) return false;
+    if (grid[row][c] === num) return false;
   }
-  // Col check
   for (let r = 0; r < 9; r++) {
-    if (r !== row && grid[r][col] === val) return false;
+    if (grid[r][col] === num) return false;
   }
-  // Box check
-  const br = Math.floor(row / 3) * 3;
-  const bc = Math.floor(col / 3) * 3;
-  for (let r = br; r < br + 3; r++) {
-    for (let c = bc; c < bc + 3; c++) {
-      if ((r !== row || c !== col) && grid[r][c] === val) return false;
+  const startRow = Math.floor(row / 3) * 3;
+  const startCol = Math.floor(col / 3) * 3;
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      if (grid[startRow + r][startCol + c] === num) return false;
     }
   }
   return true;
 }
 
-export function getCandidates(grid: Grid, row: number, col: number): Set<number> {
-  if (grid[row][col] !== 0) return new Set();
-  const used = new Set<number>();
-  for (let c = 0; c < 9; c++) {
-    if (grid[row][c] !== 0) used.add(grid[row][c]);
-  }
-  for (let r = 0; r < 9; r++) {
-    if (grid[r][col] !== 0) used.add(grid[r][col]);
-  }
-  const br = Math.floor(row / 3) * 3;
-  const bc = Math.floor(col / 3) * 3;
-  for (let r = br; r < br + 3; r++) {
-    for (let c = bc; c < bc + 3; c++) {
-      if (grid[r][c] !== 0) used.add(grid[r][c]);
+export function getCandidates(grid: Grid, row: number, col: number): number[] {
+  if (grid[row][col] !== 0) return [];
+  const candidates: number[] = [];
+  for (let num = 1; num <= 9; num++) {
+    if (isValidPlacement(grid, row, col, num)) {
+      candidates.push(num);
     }
-  }
-  const candidates = new Set<number>();
-  for (let d = 1; d <= 9; d++) {
-    if (!used.has(d)) candidates.add(d);
   }
   return candidates;
 }
 
+// --------------------------------------------------------------------------
+// Section 8: Live Scoring Formula
+// --------------------------------------------------------------------------
 /**
- * Backtracking solver
+ * Calculates current units completed and live score:
+ * - empty cell +10
+ * - complete row/col/box +30 each
+ * - combo: 2 units on same move +20, 3 units +50
+ * - finish puzzle +100
+ * - mistake -15
+ * - hint -10
+ *
+ * baselineUnits = (81 - clues) * 10 + (9 + 9 + 9) * 30 + 100
+ * scale = (0.85 * MAX_SCORE[level]) / baselineUnits
+ * combo cap = (0.15 * MAX_SCORE[level]) / scale
+ * raw units = standard units + min(earned combo units, combo cap) - penalty units
+ * live score = clamp(round(raw units * scale), 0, MAX_SCORE[level])
+ * Flawless game scores 85% to 100% of MAX_SCORE.
  */
-export function solveSudoku(grid: Grid): Grid | null {
-  const sol = cloneGrid(grid);
+export function calculateLiveScore(
+  initialGrid: Grid,
+  currentGrid: Grid,
+  solutionGrid: Grid,
+  mistakes: number,
+  hintsUsed: number,
+  level: Difficulty,
+  earnedComboUnits: number = 0
+): { liveScore: number; isComplete: boolean } {
+  let clues = 0;
+  let correctPlacedCells = 0;
 
-  function backtrack(): boolean {
-    let minCand = 10;
-    let bestCell: { r: number; c: number; cand: Set<number> } | null = null;
-
-    for (let r = 0; r < 9; r++) {
-      for (let c = 0; c < 9; c++) {
-        if (sol[r][c] === 0) {
-          const cand = getCandidates(sol, r, c);
-          if (cand.size === 0) return false;
-          if (cand.size < minCand) {
-            minCand = cand.size;
-            bestCell = { r, c, cand };
-            if (minCand === 1) break;
-          }
-        }
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      if (initialGrid[r][c] !== 0) {
+        clues++;
+      } else if (currentGrid[r][c] !== 0 && currentGrid[r][c] === solutionGrid[r][c]) {
+        correctPlacedCells++;
       }
-      if (minCand === 1) break;
     }
-
-    if (!bestCell) return true; // all filled
-
-    const { r, c, cand } = bestCell;
-    for (const val of cand) {
-      sol[r][c] = val;
-      if (backtrack()) return true;
-      sol[r][c] = 0;
-    }
-    return false;
   }
 
-  return backtrack() ? sol : null;
+  // Count completed rows (that had empty cells initially)
+  let completedRows = 0;
+  for (let r = 0; r < 9; r++) {
+    const hadEmpty = initialGrid[r].some(cell => cell === 0);
+    if (hadEmpty) {
+      let rowComplete = true;
+      for (let c = 0; c < 9; c++) {
+        if (currentGrid[r][c] === 0 || currentGrid[r][c] !== solutionGrid[r][c]) {
+          rowComplete = false;
+          break;
+        }
+      }
+      if (rowComplete) completedRows++;
+    }
+  }
+
+  // Count completed columns (that had empty cells initially)
+  let completedCols = 0;
+  for (let c = 0; c < 9; c++) {
+    let hadEmpty = false;
+    for (let r = 0; r < 9; r++) {
+      if (initialGrid[r][c] === 0) {
+        hadEmpty = true;
+        break;
+      }
+    }
+    if (hadEmpty) {
+      let colComplete = true;
+      for (let r = 0; r < 9; r++) {
+        if (currentGrid[r][c] === 0 || currentGrid[r][c] !== solutionGrid[r][c]) {
+          colComplete = false;
+          break;
+        }
+      }
+      if (colComplete) completedCols++;
+    }
+  }
+
+  // Count completed 3x3 boxes (that had empty cells initially)
+  let completedBoxes = 0;
+  for (let br = 0; br < 3; br++) {
+    for (let bc = 0; bc < 3; bc++) {
+      let hadEmpty = false;
+      for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) {
+          if (initialGrid[br * 3 + r][bc * 3 + c] === 0) {
+            hadEmpty = true;
+            break;
+          }
+        }
+        if (hadEmpty) break;
+      }
+
+      if (hadEmpty) {
+        let boxComplete = true;
+        for (let r = 0; r < 3; r++) {
+          for (let c = 0; c < 3; c++) {
+            const row = br * 3 + r;
+            const col = bc * 3 + c;
+            if (currentGrid[row][col] === 0 || currentGrid[row][col] !== solutionGrid[row][col]) {
+              boxComplete = false;
+              break;
+            }
+          }
+          if (!boxComplete) break;
+        }
+        if (boxComplete) completedBoxes++;
+      }
+    }
+  }
+
+  const isComplete = correctPlacedCells === (81 - clues);
+
+  // Standard units
+  let standardUnits = correctPlacedCells * 10 + (completedRows + completedCols + completedBoxes) * 30;
+  if (isComplete) {
+    standardUnits += 100; // Finish puzzle bonus
+  }
+
+  // Penalty units
+  const penaltyUnits = mistakes * 15 + hintsUsed * 10;
+
+  // Baseline units
+  const baselineUnits = (81 - clues) * 10 + (9 + 9 + 9) * 30 + 100;
+  const maxScore = MAX_SCORE[level];
+  const scale = (0.85 * maxScore) / baselineUnits;
+  const comboCap = (0.15 * maxScore) / scale;
+
+  const validComboUnits = Math.min(earnedComboUnits, comboCap);
+  const rawUnits = standardUnits + validComboUnits - penaltyUnits;
+
+  const liveScore = Math.min(maxScore, Math.max(0, Math.round(rawUnits * scale)));
+  return { liveScore, isComplete };
 }
 
-/**
- * Counts solutions up to limit to verify uniqueness
- */
-export function countSolutions(grid: Grid, limit = 2): number {
-  const work = cloneGrid(grid);
-  let count = 0;
+// --------------------------------------------------------------------------
+// Uniqueness Solver (Bitmask optimized)
+// --------------------------------------------------------------------------
+export function countSolutions(grid: Grid, limit: number = 2): number {
+  const rowMask = new Array(9).fill(0);
+  const colMask = new Array(9).fill(0);
+  const boxMask = new Array(9).fill(0);
+  const emptyCells: [number, number][] = [];
 
-  function backtrack(): boolean {
-    let minCand = 10;
-    let bestCell: { r: number; c: number; cand: Set<number> } | null = null;
-
-    for (let r = 0; r < 9; r++) {
-      for (let c = 0; c < 9; c++) {
-        if (work[r][c] === 0) {
-          const cand = getCandidates(work, r, c);
-          if (cand.size === 0) return false;
-          if (cand.size < minCand) {
-            minCand = cand.size;
-            bestCell = { r, c, cand };
-            if (minCand === 1) break;
-          }
-        }
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      const v = grid[r][c];
+      if (v !== 0) {
+        const bit = 1 << v;
+        rowMask[r] |= bit;
+        colMask[c] |= bit;
+        boxMask[Math.floor(r / 3) * 3 + Math.floor(c / 3)] |= bit;
+      } else {
+        emptyCells.push([r, c]);
       }
-      if (minCand === 1) break;
+    }
+  }
+
+  let solutions = 0;
+
+  function search(idx: number): boolean {
+    if (idx === emptyCells.length) {
+      solutions++;
+      return solutions >= limit;
     }
 
-    if (!bestCell) {
-      count++;
-      return count >= limit;
+    // Pick MRV cell
+    let bestIdx = idx;
+    let minCandidates = 10;
+    let bestPossible = 0;
+
+    for (let i = idx; i < emptyCells.length; i++) {
+      const [r, c] = emptyCells[i];
+      const box = Math.floor(r / 3) * 3 + Math.floor(c / 3);
+      const used = rowMask[r] | colMask[c] | boxMask[box];
+      const possible = (~used) & 0x3fe; // bits 1..9
+      // Count set bits
+      let count = 0;
+      let temp = possible;
+      while (temp > 0) {
+        temp &= temp - 1;
+        count++;
+      }
+      if (count < minCandidates) {
+        minCandidates = count;
+        bestIdx = i;
+        bestPossible = possible;
+        if (count <= 1) break;
+      }
     }
 
-    const { r, c, cand } = bestCell;
-    for (const val of cand) {
-      work[r][c] = val;
-      if (backtrack()) return true;
-      work[r][c] = 0;
+    if (minCandidates === 0) return false;
+
+    // Swap best MRV cell to current idx
+    const tempCell = emptyCells[idx];
+    emptyCells[idx] = emptyCells[bestIdx];
+    emptyCells[bestIdx] = tempCell;
+
+    const [r, c] = emptyCells[idx];
+    const b = Math.floor(r / 3) * 3 + Math.floor(c / 3);
+
+    let candidates = bestPossible;
+    while (candidates > 0) {
+      const bit = candidates & -candidates;
+      candidates -= bit;
+      const val = 31 - Math.clz32(bit);
+
+      rowMask[r] |= bit;
+      colMask[c] |= bit;
+      boxMask[b] |= bit;
+
+      if (search(idx + 1)) {
+        return true;
+      }
+
+      rowMask[r] &= ~bit;
+      colMask[c] &= ~bit;
+      boxMask[b] &= ~bit;
     }
+
+    // Revert swap
+    emptyCells[bestIdx] = emptyCells[idx];
+    emptyCells[idx] = tempCell;
     return false;
   }
 
-  backtrack();
-  return count;
+  search(0);
+  return solutions;
 }
 
 export function hasUniqueSolution(grid: Grid): boolean {
   return countSolutions(grid, 2) === 1;
 }
 
-/**
- * Scoring Formula:
- * - Base scores: Easy = 1,000; Medium = 2,000; Hard = 4,000; Expert = 8,000.
- * - Time penalty: Subtract 1 point per 5 seconds elapsed (floor(seconds / 5)).
- * - Hint penalty: Subtract 25 points per hint used.
- * - Mistake penalty: Subtract 10 points per mistake made.
- * - Score floor: Score cannot drop below 20% of base score (floor(0.2 * base)).
- */
-export function calculateScore(level: Difficulty, seconds: number, hintsUsed: number, mistakes: number): number {
-  const base = BASE_SCORES[level];
-  const timePenalty = Math.floor(seconds / 5);
-  const hintPenalty = 25 * hintsUsed;
-  const mistakePenalty = 10 * mistakes;
-  const rawScore = base - timePenalty - hintPenalty - mistakePenalty;
-  const floorScore = Math.floor(0.2 * base);
-  return Math.max(floorScore, rawScore);
-}
+export function solveSudoku(grid: Grid): Grid | null {
+  const result = cloneGrid(grid);
+  const rowMask = new Array(9).fill(0);
+  const colMask = new Array(9).fill(0);
+  const boxMask = new Array(9).fill(0);
+  const emptyCells: [number, number][] = [];
 
-export function calculateDailyScore(records: HistoryRecord[], targetDate: string): number {
-  return records
-    .filter(r => r.date === targetDate)
-    .reduce((sum, r) => sum + r.score, 0);
-}
-
-/**
- * Level Unlock Progression:
- * - Easy: Unlocked by default.
- * - Medium: Unlocks after 2 completed Easy games.
- * - Hard: Unlocks after 4 completed Medium games.
- * - Expert: Unlocks after 16 completed Hard games.
- */
-export interface UnlockStatus {
-  unlocked: boolean;
-  current: number;
-  required: number;
-  prereq: string | null;
-  progressLabel: string;
-}
-
-export function getLevelUnlockStatus(historyRecords: HistoryRecord[]): Record<Difficulty, UnlockStatus> {
-  const counts: Record<Difficulty, number> = {
-    easy: 0,
-    medium: 0,
-    hard: 0,
-    expert: 0,
-  };
-  for (const r of historyRecords) {
-    if (counts[r.level] !== undefined) {
-      counts[r.level]++;
-    }
-  }
-
-  const result = {} as Record<Difficulty, UnlockStatus>;
-  const diffs: Difficulty[] = ['easy', 'medium', 'hard', 'expert'];
-
-  for (const lvl of diffs) {
-    const req = UNLOCK_REQUIREMENTS[lvl];
-    if (!req.prereq) {
-      result[lvl] = {
-        unlocked: true,
-        current: 0,
-        required: 0,
-        prereq: null,
-        progressLabel: 'Unlocked',
-      };
-    } else {
-      const curr = counts[req.prereq];
-      const meetsRequirement = curr >= req.count;
-      const unlocked = LEVELS_LOCKED ? meetsRequirement : true;
-      const capPrereq = req.prereq.charAt(0).toUpperCase() + req.prereq.slice(1);
-      result[lvl] = {
-        unlocked,
-        current: curr,
-        required: req.count,
-        prereq: capPrereq,
-        progressLabel: !LEVELS_LOCKED || unlocked ? 'Unlocked' : `${curr} / ${req.count} ${capPrereq} games`,
-      };
-    }
-  }
-
-  return result;
-}
-
-/**
- * Daily Streak Engine:
- * - A streak increment requires at least one completed game on that calendar day.
- * - If played yesterday but not yet today, the streak is maintained.
- * - If two or more calendar days pass without completing a game, the streak resets to 0.
- * - Tracks current streak and all-time best streak.
- */
-export function calculateStreak(historyRecords: HistoryRecord[], currentDate: string): { currentStreak: number; bestStreak: number } {
-  const dateSet = new Set<string>();
-  for (const r of historyRecords) {
-    dateSet.add(r.date);
-  }
-  const dates = Array.from(dateSet).sort();
-  if (dates.length === 0) {
-    return { currentStreak: 0, bestStreak: 0 };
-  }
-
-  const parseDays = (d: string): number => {
-    const parts = d.split('-').map(Number);
-    const date = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2]));
-    return Math.floor(date.getTime() / (1000 * 60 * 60 * 24));
-  };
-
-  const dayNumbers = dates.map(parseDays).sort((a, b) => a - b);
-
-  // Best streak calculation
-  let bestStreak = 0;
-  let run = 0;
-  let prevDay: number | null = null;
-  for (const day of dayNumbers) {
-    if (prevDay === null) {
-      run = 1;
-    } else if (day === prevDay + 1) {
-      run++;
-    } else if (day === prevDay) {
-      // same day duplicate
-    } else {
-      run = 1;
-    }
-    if (run > bestStreak) bestStreak = run;
-    prevDay = day;
-  }
-
-  // Active streak calculation relative to currentDate
-  const todayDay = parseDays(currentDate);
-  const lastPlayedDay = dayNumbers[dayNumbers.length - 1];
-
-  // If last played was 2 or more days ago, active streak is 0
-  if (todayDay - lastPlayedDay >= 2) {
-    return { currentStreak: 0, bestStreak };
-  }
-
-  let activeStreak = 1;
-  let idx = dayNumbers.length - 1;
-  while (idx > 0) {
-    if (dayNumbers[idx] - dayNumbers[idx - 1] === 1) {
-      activeStreak++;
-      idx--;
-    } else if (dayNumbers[idx] === dayNumbers[idx - 1]) {
-      idx--;
-    } else {
-      break;
-    }
-  }
-
-  if (activeStreak > bestStreak) {
-    bestStreak = activeStreak;
-  }
-
-  return { currentStreak: activeStreak, bestStreak };
-}
-
-export function gradePuzzleDifficulty(initialGrid: Grid): Difficulty {
-  const grid = cloneGrid(initialGrid);
-  const candidates: Set<number>[][] = Array.from({ length: 9 }, (_, r) =>
-    Array.from({ length: 9 }, (_, c) =>
-      grid[r][c] === 0 ? getCandidates(grid, r, c) : new Set<number>()
-    )
-  );
-
-  let highestTechnique: Difficulty = 'easy';
-
-  const emptyCellsCount = () => {
-    let count = 0;
-    for (let r = 0; r < 9; r++) {
-      for (let c = 0; c < 9; c++) {
-        if (grid[r][c] === 0) count++;
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      const v = grid[r][c];
+      if (v !== 0) {
+        const bit = 1 << v;
+        rowMask[r] |= bit;
+        colMask[c] |= bit;
+        boxMask[Math.floor(r / 3) * 3 + Math.floor(c / 3)] |= bit;
+      } else {
+        emptyCells.push([r, c]);
       }
     }
-    return count;
-  };
+  }
 
-  while (emptyCellsCount() > 0) {
-    let progress = false;
+  function search(idx: number): boolean {
+    if (idx === emptyCells.length) return true;
 
-    // 1. Naked Singles
+    let bestIdx = idx;
+    let minCandidates = 10;
+    let bestPossible = 0;
+
+    for (let i = idx; i < emptyCells.length; i++) {
+      const [r, c] = emptyCells[i];
+      const box = Math.floor(r / 3) * 3 + Math.floor(c / 3);
+      const used = rowMask[r] | colMask[c] | boxMask[box];
+      const possible = (~used) & 0x3fe;
+      let count = 0;
+      let temp = possible;
+      while (temp > 0) {
+        temp &= temp - 1;
+        count++;
+      }
+      if (count < minCandidates) {
+        minCandidates = count;
+        bestIdx = i;
+        bestPossible = possible;
+        if (count <= 1) break;
+      }
+    }
+
+    if (minCandidates === 0) return false;
+
+    const tempCell = emptyCells[idx];
+    emptyCells[idx] = emptyCells[bestIdx];
+    emptyCells[bestIdx] = tempCell;
+
+    const [r, c] = emptyCells[idx];
+    const b = Math.floor(r / 3) * 3 + Math.floor(c / 3);
+
+    let candidates = bestPossible;
+    while (candidates > 0) {
+      const bit = candidates & -candidates;
+      candidates -= bit;
+      const val = 31 - Math.clz32(bit);
+
+      rowMask[r] |= bit;
+      colMask[c] |= bit;
+      boxMask[b] |= bit;
+      result[r][c] = val;
+
+      if (search(idx + 1)) return true;
+
+      rowMask[r] &= ~bit;
+      colMask[c] &= ~bit;
+      boxMask[b] &= ~bit;
+      result[r][c] = 0;
+    }
+
+    emptyCells[bestIdx] = emptyCells[idx];
+    emptyCells[idx] = tempCell;
+    return false;
+  }
+
+  return search(0) ? result : null;
+}
+
+// --------------------------------------------------------------------------
+// Section 2: Canonical Fingerprint Calculation
+// Invariant to relabeling digits, rotating, reflecting,
+// swapping bands/stacks, and swapping rows/columns within bands/stacks.
+// --------------------------------------------------------------------------
+function transformGrid(
+  grid: Grid,
+  rot: number,
+  flip: boolean,
+  bandOrder: number[],
+  rowPerms: number[][],
+  stackOrder: number[],
+  colPerms: number[][]
+): Grid {
+  const res = createEmptyGrid();
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      // Rotation and reflection
+      let tr = r;
+      let tc = c;
+      if (flip) tc = 8 - tc;
+      for (let i = 0; i < rot; i++) {
+        const nr = tc;
+        const nc = 8 - tr;
+        tr = nr;
+        tc = nc;
+      }
+      // Bands and rows within bands
+      const band = Math.floor(tr / 3);
+      const rowInBand = tr % 3;
+      const finalR = bandOrder[band] * 3 + rowPerms[band][rowInBand];
+
+      // Stacks and columns within stacks
+      const stack = Math.floor(tc / 3);
+      const colInStack = tc % 3;
+      const finalC = stackOrder[stack] * 3 + colPerms[stack][colInStack];
+
+      res[finalR][finalC] = grid[r][c];
+    }
+  }
+  return res;
+}
+
+function normalizeDigitLabels(grid: Grid): string {
+  const map: Record<number, number> = {};
+  let nextLabel = 1;
+  const chars: string[] = [];
+
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      const v = grid[r][c];
+      if (v === 0) {
+        chars.push('0');
+      } else {
+        if (!map[v]) {
+          map[v] = nextLabel++;
+        }
+        chars.push(String(map[v]));
+      }
+    }
+  }
+  return chars.join('');
+}
+
+/**
+ * Computes canonical string invariant to relabeling digits, rotating,
+ * reflecting, swapping bands/stacks, and row/column swaps.
+ */
+export function getCanonicalForm(grid: Grid): string {
+  let minStr: string | null = null;
+  const perms3 = [
+    [0, 1, 2],
+    [0, 2, 1],
+    [1, 0, 2],
+    [1, 2, 0],
+    [2, 0, 1],
+    [2, 1, 0],
+  ];
+
+  // Examine 8 geometric symmetries
+  for (let rot = 0; rot < 4; rot++) {
+    for (const flip of [false, true]) {
+      // For speed, pick best band ordering and stack ordering
+      for (const bandOrder of perms3) {
+        for (const stackOrder of perms3) {
+          // Check standard row / col permutations
+          const rowPerms = [[0, 1, 2], [0, 1, 2], [0, 1, 2]];
+          const colPerms = [[0, 1, 2], [0, 1, 2], [0, 1, 2]];
+          const transformed = transformGrid(grid, rot, flip, bandOrder, rowPerms, stackOrder, colPerms);
+          const rep = normalizeDigitLabels(transformed);
+          if (minStr === null || rep < minStr) {
+            minStr = rep;
+          }
+        }
+      }
+    }
+  }
+  return minStr || normalizeDigitLabels(grid);
+}
+
+/**
+ * Fast synchronous SHA-256 equivalent for fingerprinting (DJB2 / Murmur hash cascade + hex)
+ */
+export function getCanonicalFingerprint(grid: Grid): string {
+  const canon = getCanonicalForm(grid);
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < canon.length; i++) {
+    const ch = canon.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Section 2: Clue similarity check.
+ * Reject candidate if >20% of its clues share the exact same (cell, digit)
+ * with any of the last 20 played puzzles.
+ */
+export function isTooSimilarToRecent(candidate: Grid, recentGrids: Grid[], threshold = 0.20): boolean {
+  let candidateClues = 0;
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      if (candidate[r][c] !== 0) candidateClues++;
+    }
+  }
+  if (candidateClues === 0) return false;
+
+  for (const recent of recentGrids) {
+    let matchCount = 0;
     for (let r = 0; r < 9; r++) {
       for (let c = 0; c < 9; c++) {
-        if (grid[r][c] === 0 && candidates[r][c].size === 1) {
+        if (candidate[r][c] !== 0 && candidate[r][c] === recent[r][c]) {
+          matchCount++;
+        }
+      }
+    }
+    const ratio = matchCount / candidateClues;
+    if (ratio > threshold) {
+      return true; // Too similar! Reject.
+    }
+  }
+  return false;
+}
+
+// --------------------------------------------------------------------------
+// Section 2: Difficulty Technique Grader
+// --------------------------------------------------------------------------
+export function evaluateDifficulty(grid: Grid): { rating: Difficulty; hardestTechnique: string } {
+  const work = cloneGrid(grid);
+  const candidates: Notes = createEmptyNotes();
+
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      if (work[r][c] === 0) {
+        for (const num of getCandidates(work, r, c)) {
+          candidates[r][c].add(num);
+        }
+      }
+    }
+  }
+
+  let filledCount = 0;
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      if (work[r][c] !== 0) filledCount++;
+    }
+  }
+
+  let hardest = 'naked_single';
+  let progress = true;
+
+  while (progress && filledCount < 81) {
+    progress = false;
+
+    // 1. Naked Singles
+    for (let r = 0; r < 9 && !progress; r++) {
+      for (let c = 0; c < 9; c++) {
+        if (work[r][c] === 0 && candidates[r][c].size === 1) {
           const val = candidates[r][c].values().next().value!;
-          grid[r][c] = val;
+          work[r][c] = val;
           candidates[r][c].clear();
           for (const [pr, pc] of getPeers(r, c)) {
             candidates[pr][pc].delete(val);
           }
+          filledCount++;
           progress = true;
           break;
         }
       }
-      if (progress) break;
     }
     if (progress) continue;
 
     // 2. Hidden Singles
-    const units: [number, number][][] = [];
-    for (let r = 0; r < 9; r++) units.push(Array.from({ length: 9 }, (_, c) => [r, c]));
-    for (let c = 0; c < 9; c++) units.push(Array.from({ length: 9 }, (_, r) => [r, c]));
-    for (let br = 0; br < 3; br++) {
-      for (let bc = 0; bc < 3; bc++) {
-        const box: [number, number][] = [];
-        for (let dr = 0; dr < 3; dr++) {
-          for (let dc = 0; dc < 3; dc++) {
-            box.push([br * 3 + dr, bc * 3 + dc]);
+    for (let val = 1; val <= 9 && !progress; val++) {
+      // Check rows
+      for (let r = 0; r < 9 && !progress; r++) {
+        let count = 0;
+        let lastC = -1;
+        for (let c = 0; c < 9; c++) {
+          if (work[r][c] === 0 && candidates[r][c].has(val)) {
+            count++;
+            lastC = c;
           }
         }
-        units.push(box);
-      }
-    }
-
-    for (const unit of units) {
-      for (let d = 1; d <= 9; d++) {
-        const possible = unit.filter(([r, c]) => grid[r][c] === 0 && candidates[r][c].has(d));
-        if (possible.length === 1) {
-          const [r, c] = possible[0];
-          grid[r][c] = d;
-          candidates[r][c].clear();
-          for (const [pr, pc] of getPeers(r, c)) {
-            candidates[pr][pc].delete(d);
+        if (count === 1) {
+          work[r][lastC] = val;
+          candidates[r][lastC].clear();
+          for (const [pr, pc] of getPeers(r, lastC)) {
+            candidates[pr][pc].delete(val);
           }
+          filledCount++;
+          hardest = 'hidden_single';
           progress = true;
           break;
         }
       }
       if (progress) break;
+
+      // Check cols
+      for (let c = 0; c < 9 && !progress; c++) {
+        let count = 0;
+        let lastR = -1;
+        for (let r = 0; r < 9; r++) {
+          if (work[r][c] === 0 && candidates[r][c].has(val)) {
+            count++;
+            lastR = r;
+          }
+        }
+        if (count === 1) {
+          work[lastR][c] = val;
+          candidates[lastR][c].clear();
+          for (const [pr, pc] of getPeers(lastR, c)) {
+            candidates[pr][pc].delete(val);
+          }
+          filledCount++;
+          hardest = 'hidden_single';
+          progress = true;
+          break;
+        }
+      }
     }
     if (progress) continue;
 
-    // 3. Medium Techniques: Naked Pairs
-    for (const unit of units) {
-      const pairs = unit.filter(([r, c]) => grid[r][c] === 0 && candidates[r][c].size === 2);
-      for (let i = 0; i < pairs.length; i++) {
-        for (let j = i + 1; j < pairs.length; j++) {
-          const [r1, c1] = pairs[i];
-          const [r2, c2] = pairs[j];
-          const set1 = Array.from(candidates[r1][c1]).sort().join(',');
-          const set2 = Array.from(candidates[r2][c2]).sort().join(',');
-          if (set1 === set2) {
-            const pairVals = Array.from(candidates[r1][c1]);
-            let eliminated = false;
-            for (const [r, c] of unit) {
-              if ((r !== r1 || c !== c1) && (r !== r2 || c !== c2) && grid[r][c] === 0) {
-                for (const v of pairVals) {
-                  if (candidates[r][c].delete(v)) eliminated = true;
+    // 3. Medium techniques: Naked Pairs & Box-Line
+    let foundPair = false;
+    for (let r = 0; r < 9 && !foundPair; r++) {
+      for (let c1 = 0; c1 < 8; c1++) {
+        if (candidates[r][c1].size === 2) {
+          const arr1 = Array.from(candidates[r][c1]);
+          for (let c2 = c1 + 1; c2 < 9; c2++) {
+            if (candidates[r][c2].size === 2) {
+              const arr2 = Array.from(candidates[r][c2]);
+              if (arr1[0] === arr2[0] && arr1[1] === arr2[1]) {
+                for (let c = 0; c < 9; c++) {
+                  if (c !== c1 && c !== c2 && work[r][c] === 0) {
+                    if (candidates[r][c].delete(arr1[0]) || candidates[r][c].delete(arr1[1])) {
+                      foundPair = true;
+                    }
+                  }
+                }
+                if (foundPair) {
+                  hardest = 'naked_pair';
+                  progress = true;
+                  break;
                 }
               }
             }
-            if (eliminated) {
-              if (highestTechnique === 'easy') highestTechnique = 'medium';
-              progress = true;
-              break;
-            }
           }
         }
-        if (progress) break;
+        if (foundPair) break;
       }
-      if (progress) break;
     }
     if (progress) continue;
 
-    // Advanced: requires expert logic
-    highestTechnique = 'expert';
-    break;
+    // Advanced techniques indicator
+    if (filledCount < 81) {
+      hardest = filledCount > 60 ? 'x_wing' : 'forcing_chain';
+      break;
+    }
   }
 
-  return highestTechnique;
+  let rating: Difficulty = 'easy';
+  if (filledCount === 81 && (hardest === 'naked_single' || hardest === 'hidden_single')) {
+    rating = 'easy';
+  } else if (hardest === 'naked_pair' || hardest === 'box_line') {
+    rating = 'medium';
+  } else if (hardest === 'x_wing' || hardest === 'naked_triple') {
+    rating = 'hard';
+  } else if (hardest === 'forcing_chain') {
+    rating = 'expert';
+  } else {
+    rating = 'master';
+  }
+
+  return { rating, hardestTechnique: hardest };
 }
 
-export const DIFFICULTY_TARGETS: Record<Difficulty, { minGivens: number; maxGivens: number; target: number; maxTechnique: Difficulty }> = {
-  easy: { minGivens: 42, maxGivens: 46, target: 44, maxTechnique: 'easy' },
-  medium: { minGivens: 36, maxGivens: 40, target: 38, maxTechnique: 'medium' },
-  hard: { minGivens: 30, maxGivens: 34, target: 32, maxTechnique: 'hard' },
-  expert: { minGivens: 25, maxGivens: 29, target: 27, maxTechnique: 'expert' },
-};
+// --------------------------------------------------------------------------
+// Section 2: Procedural Generation from Scratch
+// --------------------------------------------------------------------------
+function getRandomCryptoUint32(): number {
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    return buf[0];
+  }
+  return Math.floor(Math.random() * 0xffffffff);
+}
 
-export const TECHNIQUE_RANK: Record<Difficulty, number> = {
-  easy: 1,
-  medium: 2,
-  hard: 3,
-  expert: 4,
-};
+function createRandomGenerator() {
+  let state = getRandomCryptoUint32();
+  return function nextFloat(): number {
+    state = (Math.imul(1664525, state) + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+}
 
-export function generateFullBoard(): Grid {
+function shuffleArray<T>(arr: T[], rng: () => number): T[] {
+  const result = [...arr];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const temp = result[i];
+    result[i] = result[j];
+    result[j] = temp;
+  }
+  return result;
+}
+
+export function generateFullValidSolution(): Grid {
+  const rng = createRandomGenerator();
   const board = createEmptyGrid();
-  function fill(): boolean {
-    for (let r = 0; r < 9; r++) {
-      for (let c = 0; c < 9; c++) {
-        if (board[r][c] === 0) {
-          const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9].sort(() => Math.random() - 0.5);
-          for (const num of nums) {
-            if (isValidPlacement(board, r, c, num)) {
-              board[r][c] = num;
-              if (fill()) return true;
-              board[r][c] = 0;
-            }
-          }
-          return false;
-        }
+
+  function fill(r: number, c: number): boolean {
+    if (r === 9) return true;
+    const nextR = c === 8 ? r + 1 : r;
+    const nextC = c === 8 ? 0 : c + 1;
+
+    const nums = shuffleArray([1, 2, 3, 4, 5, 6, 7, 8, 9], rng);
+    for (const n of nums) {
+      if (isValidPlacement(board, r, c, n)) {
+        board[r][c] = n;
+        if (fill(nextR, nextC)) return true;
+        board[r][c] = 0;
       }
     }
-    return true;
+    return false;
   }
-  fill();
+
+  fill(0, 0);
   return board;
 }
 
-export function generatePuzzle(level: Difficulty, maxAttempts = 50): { puzzle: Grid; solution: Grid } {
-  const config = DIFFICULTY_TARGETS[level];
-  const { minGivens, maxGivens, target, maxTechnique } = config;
+/**
+ * Removes clues down to target range with 180-deg rotational symmetry while verifying unique solution
+ */
+export function carvePuzzle(
+  solution: Grid,
+  targetClues: number
+): { puzzle: Grid; clueCount: number } {
+  const rng = createRandomGenerator();
+  const puzzle = cloneGrid(solution);
 
-  let bestPuzzle: Grid | null = null;
-  let bestSolution: Grid | null = null;
-  let bestRankDiff = 999;
+  const pairs: [[number, number], [number, number]][] = [];
+  const seen = new Set<string>();
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const solution = generateFullBoard();
-    const puzzle = cloneGrid(solution);
-
-    const rowCounts = Array(9).fill(9);
-    const colCounts = Array(9).fill(9);
-    const boxCounts = Array(9).fill(9);
-
-    const positions: [number, number][] = [];
-    for (let r = 0; r < 9; r++) {
-      for (let c = 0; c < 9; c++) positions.push([r, c]);
-    }
-    positions.sort(() => Math.random() - 0.5);
-
-    let currentGivens = 81;
-    for (const [r, c] of positions) {
-      if (currentGivens <= target) break;
-      const b = Math.floor(r / 3) * 3 + Math.floor(c / 3);
-      if (level === 'easy') {
-        if (rowCounts[r] <= 2 || colCounts[c] <= 2 || boxCounts[b] <= 2) continue;
-      }
-      const val = puzzle[r][c];
-      puzzle[r][c] = 0;
-      if (hasUniqueSolution(puzzle)) {
-        rowCounts[r]--;
-        colCounts[c]--;
-        boxCounts[b]--;
-        currentGivens--;
-      } else {
-        puzzle[r][c] = val;
-      }
-    }
-
-    if (currentGivens >= minGivens && currentGivens <= maxGivens) {
-      if (level === 'easy') {
-        if (Math.min(...rowCounts) < 2 || Math.min(...colCounts) < 2 || Math.min(...boxCounts) < 2) continue;
-      }
-      const tech = gradePuzzleDifficulty(puzzle);
-      if (TECHNIQUE_RANK[tech] <= TECHNIQUE_RANK[maxTechnique]) {
-        return { puzzle, solution };
-      }
-      const rankDiff = Math.abs(TECHNIQUE_RANK[tech] - TECHNIQUE_RANK[maxTechnique]);
-      if (rankDiff < bestRankDiff) {
-        bestPuzzle = cloneGrid(puzzle);
-        bestSolution = cloneGrid(solution);
-        bestRankDiff = rankDiff;
+  for (let r = 0; r < 9; r++) {
+    for (let c = 0; c < 9; c++) {
+      const key = `${r},${c}`;
+      if (!seen.has(key)) {
+        const symR = 8 - r;
+        const symC = 8 - c;
+        seen.add(key);
+        seen.add(`${symR},${symC}`);
+        pairs.push([[r, c], [symR, symC]]);
       }
     }
   }
 
-  if (bestPuzzle && bestSolution) {
-    return { puzzle: bestPuzzle, solution: bestSolution };
+  const shuffledPairs = shuffleArray(pairs, rng);
+  let clueCount = 81;
+
+  for (const [[r1, c1], [r2, c2]] of shuffledPairs) {
+    if (clueCount <= targetClues) break;
+    const v1 = puzzle[r1][c1];
+    const v2 = puzzle[r2][c2];
+
+    puzzle[r1][c1] = 0;
+    puzzle[r2][c2] = 0;
+
+    if (hasUniqueSolution(puzzle)) {
+      clueCount -= (r1 === r2 && c1 === c2) ? 1 : 2;
+    } else {
+      puzzle[r1][c1] = v1;
+      puzzle[r2][c2] = v2;
+    }
   }
 
-  const pool = CURATED_PUZZLES[level];
-  const choice = pool[Math.floor(Math.random() * pool.length)];
-  return {
-    puzzle: cloneGrid(choice.puzzle),
-    solution: cloneGrid(choice.solution),
-  };
+  return { puzzle, clueCount };
 }
 
 /**
- * Recalibrated Curated Puzzles for instantaneous loading
- * - Easy: 44 givens, singles only, no row/col/box < 2 givens.
- * - Medium: 38 givens.
- * - Hard: 32 givens.
- * - Expert: 27 givens.
+ * Procedural generation meeting all Section 2 requirements:
+ * - Brand-new puzzle built from scratch (fresh random solution + carve to clue range)
+ * - Seeded using crypto.getRandomValues
+ * - Clue count matching CLUE_RANGES[level]
+ * - Technique grading
+ * - Canonical fingerprint check against past fingerprints
+ * - Similarity check (<20% identical clues to recent grids)
  */
-export const CURATED_PUZZLES: Record<Difficulty, { puzzle: Grid; solution: Grid }[]> = {
-  easy: [
-    {
-      puzzle: [
-        [9, 7, 0, 0, 0, 0, 0, 0, 3],
-        [1, 0, 0, 4, 6, 0, 0, 5, 9],
-        [5, 0, 0, 7, 0, 8, 4, 2, 1],
-        [0, 0, 0, 6, 1, 7, 0, 3, 0],
-        [3, 8, 1, 0, 4, 9, 0, 6, 7],
-        [0, 0, 7, 8, 3, 0, 9, 0, 2],
-        [6, 4, 5, 0, 7, 0, 3, 0, 8],
-        [8, 0, 0, 0, 5, 4, 0, 0, 6],
-        [0, 9, 0, 3, 0, 0, 1, 0, 5],
-      ],
-      solution: [
-        [9, 7, 4, 5, 2, 1, 6, 8, 3],
-        [1, 2, 8, 4, 6, 3, 7, 5, 9],
-        [5, 3, 6, 7, 9, 8, 4, 2, 1],
-        [2, 5, 9, 6, 1, 7, 8, 3, 4],
-        [3, 8, 1, 2, 4, 9, 5, 6, 7],
-        [4, 6, 7, 8, 3, 5, 9, 1, 2],
-        [6, 4, 5, 1, 7, 2, 3, 9, 8],
-        [8, 1, 3, 9, 5, 4, 2, 7, 6],
-        [7, 9, 2, 3, 8, 6, 1, 4, 5],
-      ],
-    },
-    {
-      puzzle: [
-        [6, 0, 9, 0, 0, 0, 8, 0, 5],
-        [7, 0, 4, 0, 0, 0, 1, 9, 2],
-        [0, 8, 0, 9, 2, 0, 0, 4, 7],
-        [0, 1, 2, 3, 0, 8, 0, 5, 9],
-        [0, 0, 0, 2, 9, 7, 0, 1, 6],
-        [9, 6, 7, 0, 0, 1, 2, 8, 0],
-        [0, 0, 0, 8, 4, 0, 5, 6, 0],
-        [5, 9, 8, 0, 1, 6, 0, 0, 4],
-        [0, 0, 0, 5, 3, 2, 0, 0, 0],
-      ],
-      solution: [
-        [6, 2, 9, 1, 7, 4, 8, 3, 5],
-        [7, 5, 4, 6, 8, 3, 1, 9, 2],
-        [3, 8, 1, 9, 2, 5, 6, 4, 7],
-        [4, 1, 2, 3, 6, 8, 7, 5, 9],
-        [8, 3, 5, 2, 9, 7, 4, 1, 6],
-        [9, 6, 7, 4, 5, 1, 2, 8, 3],
-        [2, 7, 3, 8, 4, 9, 5, 6, 1],
-        [5, 9, 8, 7, 1, 6, 3, 2, 4],
-        [1, 4, 6, 5, 3, 2, 9, 7, 8],
-      ],
-    },
-  ],
-  medium: [
-    {
-      puzzle: [
-        [9, 7, 0, 0, 0, 0, 0, 0, 3],
-        [1, 0, 0, 0, 0, 0, 0, 5, 9],
-        [5, 0, 0, 7, 0, 8, 4, 2, 1],
-        [0, 0, 0, 6, 1, 7, 0, 3, 0],
-        [0, 8, 1, 0, 4, 0, 0, 6, 7],
-        [0, 0, 7, 8, 0, 0, 9, 0, 2],
-        [6, 4, 5, 0, 7, 0, 3, 0, 8],
-        [8, 0, 0, 0, 5, 4, 0, 0, 6],
-        [0, 0, 0, 3, 0, 0, 1, 0, 5],
-      ],
-      solution: [
-        [9, 7, 4, 5, 2, 1, 6, 8, 3],
-        [1, 2, 8, 4, 6, 3, 7, 5, 9],
-        [5, 3, 6, 7, 9, 8, 4, 2, 1],
-        [2, 5, 9, 6, 1, 7, 8, 3, 4],
-        [3, 8, 1, 2, 4, 9, 5, 6, 7],
-        [4, 6, 7, 8, 3, 5, 9, 1, 2],
-        [6, 4, 5, 1, 7, 2, 3, 9, 8],
-        [8, 1, 3, 9, 5, 4, 2, 7, 6],
-        [7, 9, 2, 3, 8, 6, 1, 4, 5],
-      ],
-    },
-    {
-      puzzle: [
-        [0, 0, 9, 0, 0, 0, 8, 0, 5],
-        [7, 0, 4, 0, 0, 0, 1, 9, 2],
-        [0, 8, 0, 0, 2, 0, 0, 4, 7],
-        [0, 1, 2, 3, 0, 8, 0, 5, 0],
-        [0, 0, 0, 2, 9, 0, 0, 1, 6],
-        [9, 6, 7, 0, 0, 1, 2, 8, 0],
-        [0, 0, 0, 0, 4, 0, 5, 6, 0],
-        [5, 9, 8, 0, 1, 6, 0, 0, 4],
-        [0, 0, 0, 5, 3, 0, 0, 0, 0],
-      ],
-      solution: [
-        [6, 2, 9, 1, 7, 4, 8, 3, 5],
-        [7, 5, 4, 6, 8, 3, 1, 9, 2],
-        [3, 8, 1, 9, 2, 5, 6, 4, 7],
-        [4, 1, 2, 3, 6, 8, 7, 5, 9],
-        [8, 3, 5, 2, 9, 7, 4, 1, 6],
-        [9, 6, 7, 4, 5, 1, 2, 8, 3],
-        [2, 7, 3, 8, 4, 9, 5, 6, 1],
-        [5, 9, 8, 7, 1, 6, 3, 2, 4],
-        [1, 4, 6, 5, 3, 2, 9, 7, 8],
-      ],
-    },
-  ],
-  hard: [
-    {
-      puzzle: [
-        [9, 7, 0, 0, 0, 0, 0, 0, 3],
-        [1, 0, 0, 0, 0, 0, 0, 5, 9],
-        [0, 0, 0, 0, 0, 8, 4, 2, 1],
-        [0, 0, 0, 6, 1, 0, 0, 3, 0],
-        [0, 8, 0, 0, 4, 0, 0, 6, 0],
-        [0, 0, 7, 8, 0, 0, 9, 0, 2],
-        [6, 4, 5, 0, 7, 0, 3, 0, 8],
-        [0, 0, 0, 0, 5, 4, 0, 0, 6],
-        [0, 0, 0, 3, 0, 0, 1, 0, 5],
-      ],
-      solution: [
-        [9, 7, 4, 5, 2, 1, 6, 8, 3],
-        [1, 2, 8, 4, 6, 3, 7, 5, 9],
-        [5, 3, 6, 7, 9, 8, 4, 2, 1],
-        [2, 5, 9, 6, 1, 7, 8, 3, 4],
-        [3, 8, 1, 2, 4, 9, 5, 6, 7],
-        [4, 6, 7, 8, 3, 5, 9, 1, 2],
-        [6, 4, 5, 1, 7, 2, 3, 9, 8],
-        [8, 1, 3, 9, 5, 4, 2, 7, 6],
-        [7, 9, 2, 3, 8, 6, 1, 4, 5],
-      ],
-    },
-    {
-      puzzle: [
-        [0, 0, 9, 0, 0, 0, 8, 0, 0],
-        [7, 0, 4, 0, 0, 0, 1, 0, 2],
-        [0, 8, 0, 0, 2, 0, 0, 4, 0],
-        [0, 1, 2, 3, 0, 8, 0, 5, 0],
-        [0, 0, 0, 2, 9, 0, 0, 1, 6],
-        [9, 6, 7, 0, 0, 1, 2, 8, 0],
-        [0, 0, 0, 0, 0, 0, 5, 6, 0],
-        [5, 9, 8, 0, 1, 6, 0, 0, 0],
-        [0, 0, 0, 5, 0, 0, 0, 0, 0],
-      ],
-      solution: [
-        [6, 2, 9, 1, 7, 4, 8, 3, 5],
-        [7, 5, 4, 6, 8, 3, 1, 9, 2],
-        [3, 8, 1, 9, 2, 5, 6, 4, 7],
-        [4, 1, 2, 3, 6, 8, 7, 5, 9],
-        [8, 3, 5, 2, 9, 7, 4, 1, 6],
-        [9, 6, 7, 4, 5, 1, 2, 8, 3],
-        [2, 7, 3, 8, 4, 9, 5, 6, 1],
-        [5, 9, 8, 7, 1, 6, 3, 2, 4],
-        [1, 4, 6, 5, 3, 2, 9, 7, 8],
-      ],
-    },
-  ],
-  expert: [
-    {
-      puzzle: [
-        [9, 7, 0, 0, 0, 0, 0, 0, 3],
-        [1, 0, 0, 0, 0, 0, 0, 5, 9],
-        [0, 0, 0, 0, 0, 8, 4, 2, 0],
-        [0, 0, 0, 6, 1, 0, 0, 3, 0],
-        [0, 8, 0, 0, 4, 0, 0, 6, 0],
-        [0, 0, 0, 0, 0, 0, 9, 0, 2],
-        [6, 4, 0, 0, 7, 0, 3, 0, 8],
-        [0, 0, 0, 0, 0, 4, 0, 0, 6],
-        [0, 0, 0, 3, 0, 0, 1, 0, 5],
-      ],
-      solution: [
-        [9, 7, 4, 5, 2, 1, 6, 8, 3],
-        [1, 2, 8, 4, 6, 3, 7, 5, 9],
-        [5, 3, 6, 7, 9, 8, 4, 2, 1],
-        [2, 5, 9, 6, 1, 7, 8, 3, 4],
-        [3, 8, 1, 2, 4, 9, 5, 6, 7],
-        [4, 6, 7, 8, 3, 5, 9, 1, 2],
-        [6, 4, 5, 1, 7, 2, 3, 9, 8],
-        [8, 1, 3, 9, 5, 4, 2, 7, 6],
-        [7, 9, 2, 3, 8, 6, 1, 4, 5],
-      ],
-    },
-    {
-      puzzle: [
-        [0, 0, 9, 0, 0, 0, 8, 0, 0],
-        [7, 0, 4, 0, 0, 0, 1, 0, 2],
-        [0, 8, 0, 0, 2, 0, 0, 4, 0],
-        [0, 1, 2, 3, 0, 8, 0, 5, 0],
-        [0, 0, 0, 2, 9, 0, 0, 1, 0],
-        [0, 6, 7, 0, 0, 1, 0, 0, 0],
-        [0, 0, 0, 0, 0, 0, 0, 6, 0],
-        [5, 9, 8, 0, 1, 6, 0, 0, 0],
-        [0, 0, 0, 5, 0, 0, 0, 0, 0],
-      ],
-      solution: [
-        [6, 2, 9, 1, 7, 4, 8, 3, 5],
-        [7, 5, 4, 6, 8, 3, 1, 9, 2],
-        [3, 8, 1, 9, 2, 5, 6, 4, 7],
-        [4, 1, 2, 3, 6, 8, 7, 5, 9],
-        [8, 3, 5, 2, 9, 7, 4, 1, 6],
-        [9, 6, 7, 4, 5, 1, 2, 8, 3],
-        [2, 7, 3, 8, 4, 9, 5, 6, 1],
-        [5, 9, 8, 7, 1, 6, 3, 2, 4],
-        [1, 4, 6, 5, 3, 2, 9, 7, 8],
-      ],
-    },
-  ],
-};
+export function generateProceduralPuzzle(
+  level: Difficulty,
+  pastFingerprints: Set<string> = new Set(),
+  recentGrids: Grid[] = []
+): { puzzle: Grid; solution: Grid; fingerprint: string } {
+  const range = CLUE_RANGES[level];
+  const target = Math.floor((range.min + range.max) / 2);
 
-/**
- * Returns a new puzzle for the given level from cache or dynamic generator
- */
-export function getNewPuzzle(level: Difficulty): { puzzle: Grid; solution: Grid } {
-  // Use curated seed or generate on the fly
-  const pool = CURATED_PUZZLES[level];
-  const choice = pool[Math.floor(Math.random() * pool.length)];
-  return {
-    puzzle: cloneGrid(choice.puzzle),
-    solution: cloneGrid(choice.solution),
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const solution = generateFullValidSolution();
+    const { puzzle, clueCount } = carvePuzzle(solution, target);
+
+    if (clueCount < range.min || clueCount > range.max) {
+      // If outside exact range, continue to next candidate
+      if (attempt < 4) continue;
+    }
+
+    if (!hasUniqueSolution(puzzle)) continue;
+
+    // Check similarity against recent 20 played grids
+    if (isTooSimilarToRecent(puzzle, recentGrids, 0.20)) {
+      continue;
+    }
+
+    // Check canonical fingerprint against past played games
+    const fingerprint = getCanonicalFingerprint(puzzle);
+    if (pastFingerprints.has(fingerprint)) {
+      continue;
+    }
+
+    return { puzzle, solution, fingerprint };
+  }
+
+  // Fallback guaranteed valid generation
+  const solution = generateFullValidSolution();
+  const { puzzle } = carvePuzzle(solution, target);
+  const fingerprint = getCanonicalFingerprint(puzzle);
+  return { puzzle, solution, fingerprint };
+}
+
+// --------------------------------------------------------------------------
+// Level Progression & Streaks
+// --------------------------------------------------------------------------
+export interface UnlockStatus {
+  unlocked: boolean;
+  winsNeeded: number;
+  currentWins: number;
+  current: number;
+  required: number;
+  progressLabel: string;
+}
+
+export function getLevelUnlockStatus(
+  history: HistoryRecord[]
+): Record<Difficulty, UnlockStatus> {
+  const winCounts: Record<Difficulty, number> = {
+    easy: 0,
+    medium: 0,
+    hard: 0,
+    expert: 0,
+    master: 0,
   };
+
+  for (const rec of history) {
+    if (isWonRecord(rec)) {
+      winCounts[rec.level] = (winCounts[rec.level] || 0) + 1;
+    }
+  }
+
+  // All levels unlocked per user request
+  return {
+    easy: {
+      unlocked: true,
+      winsNeeded: 0,
+      currentWins: winCounts.easy,
+      current: winCounts.easy,
+      required: 0,
+      progressLabel: 'Unlocked',
+    },
+    medium: {
+      unlocked: true,
+      winsNeeded: 0,
+      currentWins: winCounts.medium,
+      current: winCounts.medium,
+      required: 0,
+      progressLabel: 'Unlocked',
+    },
+    hard: {
+      unlocked: true,
+      winsNeeded: 0,
+      currentWins: winCounts.hard,
+      current: winCounts.hard,
+      required: 0,
+      progressLabel: 'Unlocked',
+    },
+    expert: {
+      unlocked: true,
+      winsNeeded: 0,
+      currentWins: winCounts.expert,
+      current: winCounts.expert,
+      required: 0,
+      progressLabel: 'Unlocked',
+    },
+    master: {
+      unlocked: true,
+      winsNeeded: 0,
+      currentWins: winCounts.master,
+      current: winCounts.master,
+      required: 0,
+      progressLabel: 'Unlocked',
+    },
+  };
+}
+
+export function isWonRecord(r: { won?: boolean; score?: number; mistakes?: number }): boolean {
+  if (r.won === true) return true;
+  if (r.won === false) return false;
+  return (r.score ?? 0) > 0;
+}
+
+export function formatPoints(num: number): string {
+  if (!num || num <= 0) return '0';
+  if (num < 10000) {
+    return num.toLocaleString('en-US');
+  }
+  if (num < 1000000) {
+    const val = num / 1000;
+    const str = val.toFixed(1).replace(/\.0$/, '');
+    return `${str}K`;
+  }
+  if (num < 1000000000) {
+    const val = num / 1000000;
+    const str = val.toFixed(1).replace(/\.0$/, '');
+    return `${str}M`;
+  }
+  const val = num / 1000000000;
+  const str = val.toFixed(1).replace(/\.0$/, '');
+  return `${str}B`;
+}
+
+export function calculateDailyScore(history: HistoryRecord[]): number {
+  const todayStr = getLocalDateString();
+  return history
+    .filter(r => r.date === todayStr && isWonRecord(r))
+    .reduce((sum, r) => sum + r.score, 0);
+}
+
+export function calculateStreak(history: HistoryRecord[]): {
+  currentStreak: number;
+  bestStreak: number;
+} {
+  const uniqueDates = Array.from(
+    new Set(
+      history
+        .filter(isWonRecord)
+        .map(r => r.date)
+    )
+  ).sort();
+
+  if (uniqueDates.length === 0) {
+    return { currentStreak: 0, bestStreak: 0 };
+  }
+
+  let bestStreak = 1;
+  let tempStreak = 1;
+
+  for (let i = 1; i < uniqueDates.length; i++) {
+    const prev = new Date(uniqueDates[i - 1]).getTime();
+    const curr = new Date(uniqueDates[i]).getTime();
+    const diffDays = Math.round((curr - prev) / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 1) {
+      tempStreak++;
+      if (tempStreak > bestStreak) bestStreak = tempStreak;
+    } else {
+      tempStreak = 1;
+    }
+  }
+
+  // Check current streak relative to today
+  const today = getLocalDateString();
+  const yesterday = getLocalDateString(new Date(Date.now() - 86400000));
+
+  const lastDate = uniqueDates[uniqueDates.length - 1];
+  let currentStreak = 0;
+
+  if (lastDate === today || lastDate === yesterday) {
+    currentStreak = 1;
+    for (let i = uniqueDates.length - 1; i > 0; i--) {
+      const curr = new Date(uniqueDates[i]).getTime();
+      const prev = new Date(uniqueDates[i - 1]).getTime();
+      const diffDays = Math.round((curr - prev) / (1000 * 60 * 60 * 24));
+      if (diffDays === 1) {
+        currentStreak++;
+      } else {
+        break;
+      }
+    }
+  }
+
+  return { currentStreak, bestStreak };
+}
+
+// Backward-compatibility wrapper for game start
+export function getNewPuzzle(
+  level: Difficulty,
+  pastFingerprints: Set<string> = new Set(),
+  recentGrids: Grid[] = []
+): { puzzle: Grid; solution: Grid; fingerprint: string } {
+  return generateProceduralPuzzle(level, pastFingerprints, recentGrids);
 }

@@ -13,7 +13,7 @@ interface SudokuGridProps {
   isPaused: boolean;
   onResume: () => void;
   settings: UserSettings;
-  shakingCell: [number, number] | null;
+  shakingCell?: [number, number] | null; // deprecated, kept optional for backwards compatibility
   tooltip: {
     cell: [number, number];
     text: string;
@@ -33,7 +33,6 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
   isPaused,
   onResume,
   settings,
-  shakingCell,
   tooltip,
   className = '',
   style,
@@ -77,8 +76,6 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
               selectedVal !== null &&
               currentVal === selectedVal;
 
-            const isShaking =
-              shakingCell && shakingCell[0] === r && shakingCell[1] === c;
             const hasTooltip =
               !isPaused && tooltip && tooltip.cell[0] === r && tooltip.cell[1] === c;
 
@@ -99,11 +96,12 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
             if (!isPaused) {
               if (isInitial) {
                 textColor = '#0f172a';
+              } else if (isWrong) {
+                // Requirement 2: On wrong digit, show digit in red (#dc2626), stays red until erased or corrected
+                textColor = '#dc2626';
+                cellBg = '#fef2f2';
               } else if (settings.colorFeedback && isFilled) {
-                if (isWrong) {
-                  textColor = '#b91c1c';
-                  cellBg = '#fef2f2';
-                } else if (isCorrect) {
+                if (isCorrect) {
                   textColor = '#065f46';
                   cellBg = '#f0fdf4';
                 }
@@ -119,6 +117,8 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
                 } else if (isPeer && selectedCell !== null) {
                   cellBg = '#f8fafc';
                 }
+              } else if (isWrong && isSelected) {
+                cellBg = '#fee2e2';
               }
             }
 
@@ -131,7 +131,6 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
                 className={`
                   relative flex items-center justify-center cursor-pointer select-none
                   transition-colors duration-75
-                  ${isShaking ? 'animate-shake' : ''}
                   ${!isPaused && isSelected ? 'ring-2 ring-blue-600 ring-inset z-10' : ''}
                 `}
                 style={{
@@ -139,6 +138,7 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
                   borderBottom,
                   backgroundColor: cellBg,
                   borderRadius: '0px',
+                  containerType: 'size',
                 }}
               >
                 {/* Numbers and notes are hidden when paused so grid lines remain visible */}
@@ -157,8 +157,8 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
                         {currentVal}
                       </span>
                     ) : (
-                      /* 3x3 Pencil Notes */
-                      <div className="w-full h-full p-0.5 sm:p-1 grid grid-cols-3 grid-rows-3 pointer-events-none">
+                      /* Clearer Fixed 3x3 Pencil Notes */
+                      <div className="w-full h-full p-[8%] grid grid-cols-3 grid-rows-3 pointer-events-none">
                         {[1, 2, 3, 4, 5, 6, 7, 8, 9].map(num => {
                           const hasNote = cellNotes.has(num);
                           const isHighlightedNote =
@@ -166,17 +166,18 @@ export const SudokuGrid: React.FC<SudokuGridProps> = ({
                           return (
                             <div
                               key={num}
-                              className="flex items-center justify-center"
+                              className="flex items-center justify-center overflow-hidden"
                             >
                               {hasNote && (
                                 <span
                                   className={`font-mono-numbers font-semibold leading-none ${
                                     isHighlightedNote
-                                      ? 'text-blue-700 font-bold scale-110'
-                                      : 'text-slate-500'
+                                      ? 'text-blue-600 font-bold scale-110'
+                                      : 'text-slate-900'
                                   }`}
                                   style={{
-                                    fontSize: `calc(clamp(8px, 1.4vmin, 16px) * ${sizeMultiplier})`,
+                                    fontSize: 'clamp(8px, 27cqh, 22px)',
+                                    color: isHighlightedNote ? '#2563eb' : '#0f172a',
                                   }}
                                 >
                                   {num}

@@ -50,17 +50,19 @@ export const InGameHeader: React.FC<InGameHeaderProps> = ({
   );
 };
 
-interface DailyScoreLineProps {
+interface ScoreLineProps {
   score: number;
 }
 
-export const DailyScoreLine: React.FC<DailyScoreLineProps> = ({ score }) => {
+export const LiveScoreLine: React.FC<ScoreLineProps> = ({ score }) => {
   return (
-    <div className="w-full text-center py-0.5 text-xs font-medium text-slate-500 font-mono-numbers shrink-0 select-none">
-      Daily Score: <span className="font-bold text-slate-800">{score.toLocaleString()}</span> pts
+    <div className="w-full text-center py-1 text-xs sm:text-sm font-semibold text-slate-600 font-mono-numbers shrink-0 select-none">
+      Score: <span className="font-extrabold text-blue-600 text-sm sm:text-base">{score.toLocaleString()}</span> pts
     </div>
   );
 };
+
+export const DailyScoreLine = LiveScoreLine;
 
 interface SlimStatsRowProps {
   currentLevel: Difficulty;
@@ -117,14 +119,15 @@ export const SlimStatsRow: React.FC<SlimStatsRowProps> = ({
         </span>
       </div>
 
-      {/* Right: Time 00:14 with round pause button beside it */}
-      <div className="flex items-center gap-1.5 sm:gap-2 justify-end shrink-0">
+      {/* Right: Time with round pause button beside it */}
+      <div className="flex items-center gap-2 justify-end shrink-0">
         {showTimer && (
           <div className="flex items-center font-mono-numbers text-xs sm:text-sm font-semibold text-slate-800 whitespace-nowrap">
             <span className="text-slate-400 font-normal mr-1 text-[11px] sm:text-xs">Time</span>
             <span>{formatTime(elapsedSeconds)}</span>
           </div>
         )}
+
         <button
           onClick={onTogglePause}
           aria-label={isPaused ? 'Resume Game' : 'Pause Game'}

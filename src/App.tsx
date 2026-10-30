@@ -2,7 +2,7 @@
  * ZenSudoku - Desktop Minimalist Sudoku Application
  */
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import {
   Difficulty,
   GameState,
@@ -10,25 +10,35 @@ import {
   MoveAction,
   UserSettings,
   DEFAULT_SETTINGS,
-  calculateScore,
   calculateDailyScore,
   calculateStreak,
   getLevelUnlockStatus,
-  getNewPuzzle,
-  getCandidates,
+  generateProceduralPuzzle,
+  isCellLocked,
+  calculateLiveScore,
+  migrateHistoryRecord,
   cloneGrid,
   cloneNotes,
   cloneBoolGrid,
   createEmptyBoolGrid,
   createEmptyNotes,
   getPeers,
+  MAX_SCORE,
+  getLocalDateString,
+  isWonRecord,
 } from './logic/sudokuLogic';
 import {
   loadZenData,
   saveZenData,
-  exportBackupJSON,
-  importBackupJSON,
-  ZenSudokuStorage,
+  downloadBackupFile,
+  createBackupBinary,
+  parseAndValidateBackup,
+  saveRollbackCopy,
+  restoreRollbackCopy,
+  loadStoredFingerprints,
+  saveStoredFingerprint,
+  loadRecentPlayedGrids,
+  savePlayedGrid,
 } from './utils/storage';
 import { sounds } from './utils/soundEffects';
 import { Header } from './components/Header';
@@ -40,9 +50,10 @@ import { CompletionModal } from './components/CompletionModal';
 import { AnalyticsModal } from './components/AnalyticsModal';
 import { SettingsModal } from './components/SettingsModal';
 import { MenuDrawer } from './components/MenuDrawer';
+import { PrintPuzzlesModal } from './components/PrintPuzzlesModal';
 import {
   InGameHeader,
-  DailyScoreLine,
+  LiveScoreLine,
   SlimStatsRow,
   ToolButtonsRow,
   NumberPadRow,
@@ -61,8 +72,14 @@ export default function App() {
   const [analyticsInitialTab, setAnalyticsInitialTab] = useState<'analytics' | 'history'>('analytics');
   const [isAnalyticsOpen, setIsAnalyticsOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
   const [isLivesModalOpen, setIsLivesModalOpen] = useState(false);
   const [isCompletionModalOpen, setIsCompletionModalOpen] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [pendingBackupRestore, setPendingBackupRestore] = useState<{
+    records: HistoryRecord[];
+    settings: UserSettings;
+  } | null>(null);
 
   // --- Responsive Window Dimensions for Layout ---
   const [windowDimensions, setWindowDimensions] = useState({
@@ -91,7 +108,6 @@ export default function App() {
   const [currentLevel, setCurrentLevel] = useState<Difficulty>('easy');
   const [selectedCell, setSelectedCell] = useState<[number, number] | null>([0, 0]);
   const [isNotesMode, setIsNotesMode] = useState(false);
-  const [shakingCell, setShakingCell] = useState<[number, number] | null>(null);
   const [tooltip, setTooltip] = useState<{ cell: [number, number]; text: string } | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
@@ -101,7 +117,9 @@ export default function App() {
   // --- Initialize from Local Storage on mount ---
   useEffect(() => {
     const data = loadZenData();
-    setHistory(data.history || []);
+    // Migrate old history records to new scoring scale
+    const migratedHistory = (data.history || []).map(migrateHistoryRecord);
+    setHistory(migratedHistory);
     setSettings(data.settings || DEFAULT_SETTINGS);
     sounds.enabled = data.settings?.soundEffects ?? true;
 
@@ -120,39 +138,31 @@ export default function App() {
     }
   }, []);
 
-  // Update sound manager whenever settings change
-  useEffect(() => {
-    sounds.enabled = settings.soundEffects;
-  }, [settings.soundEffects]);
+  // --- Sync with localStorage ---
+  const syncStorage = useCallback(
+    (newHistory: HistoryRecord[], newActiveGame: GameState | null, newSettings: UserSettings) => {
+      saveZenData({
+        version: 1,
+        history: newHistory,
+        activeGame: newActiveGame,
+        settings: newSettings,
+      });
+    },
+    []
+  );
 
-  // Sync state to local storage
-  const syncStorage = useCallback((
-    newHistory: HistoryRecord[],
-    newActiveGame: GameState | null,
-    newSettings: UserSettings
-  ) => {
-    const storageData: ZenSudokuStorage = {
-      version: 1,
-      history: newHistory,
-      activeGame: newActiveGame,
-      settings: newSettings,
-    };
-    saveZenData(storageData);
-  }, []);
-
-  // Current local calendar date YYYY-MM-DD
-  const getTodayISO = () => {
-    const d = new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
+  const getTodayISO = (): string => {
+    return getLocalDateString();
   };
 
-  const todayISO = getTodayISO();
-  const { currentStreak, bestStreak } = calculateStreak(history, todayISO);
-  const dailyScore = calculateDailyScore(history, todayISO);
+  const { currentStreak, bestStreak } = calculateStreak(history);
+  const dailyScore = calculateDailyScore(history);
   const unlockStatus = getLevelUnlockStatus(history);
+
+  const todayGames = useMemo(() => {
+    const today = getTodayISO();
+    return history.filter(r => r.date === today && isWonRecord(r));
+  }, [history]);
 
   // --- Show Tooltip on Cell ---
   const triggerTooltip = useCallback((cell: [number, number], text: string) => {
@@ -168,40 +178,77 @@ export default function App() {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
     setToastMessage(msg);
     toastTimerRef.current = setTimeout(() => {
-      setToastMessage(null), 2500;
-    });
+      setToastMessage(null);
+    }, 2500);
   }, []);
+
+  // --- Section 8: Live Score Calculation ---
+  const { liveScore } = useMemo(() => {
+    if (!activeGame) return { liveScore: 0, isComplete: false };
+    return calculateLiveScore(
+      activeGame.initialGrid,
+      activeGame.currentGrid,
+      activeGame.solutionGrid,
+      activeGame.mistakes,
+      activeGame.hintsUsed,
+      activeGame.level,
+      activeGame.earnedComboUnits || 0
+    );
+  }, [activeGame]);
 
   // --- Start a New Game ---
   const startNewGame = useCallback((level: Difficulty) => {
-    const { puzzle, solution } = getNewPuzzle(level);
-    const newGame: GameState = {
-      id: `game-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      level,
-      initialGrid: puzzle,
-      solutionGrid: solution,
-      currentGrid: cloneGrid(puzzle),
-      notes: createEmptyNotes(),
-      hintedCells: createEmptyBoolGrid(),
-      mistakes: 0,
-      hintsUsed: 0,
-      elapsedSeconds: 0,
-      isPaused: false,
-      isCompleted: false,
-      undoStack: [],
-      redoStack: [],
-      startTime: Date.now(),
-      finalScore: 0,
-    };
+    setIsGenerating(true);
 
-    setActiveGame(newGame);
-    setCurrentLevel(level);
-    setSelectedCell([0, 0]);
-    setIsNotesMode(false);
-    setIsLivesModalOpen(false);
-    setIsCompletionModalOpen(false);
-    setCurrentView('game');
-    syncStorage(history, newGame, settings);
+    // Use requestAnimationFrame / setTimeout to allow UI render of loading state if generation takes time
+    setTimeout(() => {
+      try {
+        const storedFingerprints = loadStoredFingerprints();
+        const recentGrids = loadRecentPlayedGrids();
+
+        const { puzzle, solution, fingerprint } = generateProceduralPuzzle(
+          level,
+          storedFingerprints,
+          recentGrids
+        );
+
+        // Save fingerprint and grid to local storage
+        saveStoredFingerprint(fingerprint);
+        savePlayedGrid(puzzle);
+
+        const newGame: GameState = {
+          id: `game-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          level,
+          initialGrid: puzzle,
+          solutionGrid: solution,
+          currentGrid: cloneGrid(puzzle),
+          notes: createEmptyNotes(),
+          hintedCells: createEmptyBoolGrid(),
+          mistakes: 0,
+          totalMistakes: 0,
+          hintsUsed: 0,
+          elapsedSeconds: 0,
+          isPaused: false,
+          isCompleted: false,
+          undoStack: [],
+          redoStack: [],
+          startTime: Date.now(),
+          finalScore: 0,
+          earnedComboUnits: 0,
+        };
+
+        setActiveGame(newGame);
+        setCurrentLevel(level);
+        setSelectedCell([0, 0]);
+        setIsNotesMode(false);
+        setIsLivesModalOpen(false);
+        setIsCompletionModalOpen(false);
+        setCurrentView('game');
+        syncStorage(history, newGame, settings);
+      } finally {
+        setIsGenerating(false);
+      }
+    }, 20);
   }, [history, settings, syncStorage]);
 
   // --- Game Timer Loop ---
@@ -243,22 +290,28 @@ export default function App() {
   // --- Handle Game Completion ---
   const handleVictory = useCallback((finalGame: GameState) => {
     sounds.playVictory();
-    const finalScore = calculateScore(
-      finalGame.level,
-      finalGame.elapsedSeconds,
+    const { liveScore: finalScore } = calculateLiveScore(
+      finalGame.initialGrid,
+      finalGame.currentGrid,
+      finalGame.solutionGrid,
+      finalGame.mistakes,
       finalGame.hintsUsed,
-      finalGame.mistakes
+      finalGame.level,
+      finalGame.earnedComboUnits || 0
     );
 
+    const totalMistakesCount = finalGame.totalMistakes ?? finalGame.mistakes;
     const record: HistoryRecord = {
       id: finalGame.id,
       date: getTodayISO(),
       timestamp: Date.now(),
       level: finalGame.level,
+      timeSeconds: finalGame.elapsedSeconds,
       seconds: finalGame.elapsedSeconds,
       score: finalScore,
       hintsUsed: finalGame.hintsUsed,
-      mistakes: finalGame.mistakes,
+      mistakes: totalMistakesCount,
+      won: true,
     };
 
     const newHistory = [...history, record];
@@ -267,6 +320,8 @@ export default function App() {
       isCompleted: true,
       finalScore,
       completedTime: Date.now(),
+      mistakes: totalMistakesCount,
+      totalMistakes: totalMistakesCount,
     };
 
     setHistory(newHistory);
@@ -274,6 +329,32 @@ export default function App() {
     setIsCompletionModalOpen(true);
     syncStorage(newHistory, null, settings);
   }, [history, settings, syncStorage]);
+
+  // Helper: check if a specific unit (row, col, or box) was already complete before a placement
+  const isRowComplete = (grid: number[][], solution: number[][], row: number) => {
+    for (let c = 0; c < 9; c++) {
+      if (grid[row][c] === 0 || grid[row][c] !== solution[row][c]) return false;
+    }
+    return true;
+  };
+
+  const isColComplete = (grid: number[][], solution: number[][], col: number) => {
+    for (let r = 0; r < 9; r++) {
+      if (grid[r][col] === 0 || grid[r][col] !== solution[r][col]) return false;
+    }
+    return true;
+  };
+
+  const isBoxComplete = (grid: number[][], solution: number[][], br: number, bc: number) => {
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        const row = br * 3 + r;
+        const col = bc * 3 + c;
+        if (grid[row][col] === 0 || grid[row][col] !== solution[row][col]) return false;
+      }
+    }
+    return true;
+  };
 
   // --- Input a Digit (or Note) ---
   const handleInputDigit = useCallback((digit: number) => {
@@ -285,9 +366,10 @@ export default function App() {
 
     const [r, c] = selectedCell;
 
-    // Check if cell is pre-filled initial clue
-    if (activeGame.initialGrid[r][c] !== 0) {
-      triggerTooltip([r, c], "Can't fill pre-filled box");
+    // Section 3: Correct digits locked
+    // Once a correct digit is placed (or if cell was an initial clue), it cannot be changed, overwritten, erased, noted, or undone.
+    if (isCellLocked(r, c, activeGame.initialGrid, activeGame.currentGrid, activeGame.solutionGrid)) {
+      triggerTooltip([r, c], "Cell is locked");
       return;
     }
 
@@ -326,24 +408,23 @@ export default function App() {
     // Digit Entry Mode
     const prevVal = activeGame.currentGrid[r][c];
     if (prevVal === digit) {
-      // already contains this number
       return;
     }
 
     const isCorrect = digit === activeGame.solutionGrid[r][c];
 
     if (!isCorrect) {
-      // Mistake!
-      sounds.playError();
+      // Section 4: Wrong input: red only (#dc2626), NO shake, wobble, or movement animation
+      // Section 5: Plays existing erase sound
+      sounds.playWrongDigit();
       if (settings.hapticFeedback && navigator.vibrate) {
         navigator.vibrate(200);
       }
-      setShakingCell([r, c]);
-      setTimeout(() => setShakingCell(null), 350);
 
       const newMistakes = activeGame.mistakes + 1;
+      const newTotalMistakes = (activeGame.totalMistakes ?? activeGame.mistakes) + 1;
       const newGrid = cloneGrid(activeGame.currentGrid);
-      newGrid[r][c] = digit; // Remains editable & visible in red
+      newGrid[r][c] = digit; // Remains editable & visible in red (not locked)
 
       const moveAction: MoveAction = {
         actionType: 'digit',
@@ -359,6 +440,7 @@ export default function App() {
         ...activeGame,
         currentGrid: newGrid,
         mistakes: newMistakes,
+        totalMistakes: newTotalMistakes,
         undoStack: [...activeGame.undoStack, moveAction],
         redoStack: [],
       };
@@ -366,7 +448,6 @@ export default function App() {
       setActiveGame(updatedGame);
       syncStorage(history, updatedGame, settings);
 
-      // Check if 3 mistakes reached -> trigger 5-second lives modal
       if (newMistakes >= 3) {
         setIsLivesModalOpen(true);
       }
@@ -374,22 +455,43 @@ export default function App() {
     }
 
     // Correct entry!
-    sounds.playClick();
+    // Section 5: Play clean pop/tick
+    sounds.playCorrect();
+
+    // Check combos before applying move
+    const prevRowDone = isRowComplete(activeGame.currentGrid, activeGame.solutionGrid, r);
+    const prevColDone = isColComplete(activeGame.currentGrid, activeGame.solutionGrid, c);
+    const br = Math.floor(r / 3);
+    const bc = Math.floor(c / 3);
+    const prevBoxDone = isBoxComplete(activeGame.currentGrid, activeGame.solutionGrid, br, bc);
+
     const newGrid = cloneGrid(activeGame.currentGrid);
     newGrid[r][c] = digit;
 
+    const nextRowDone = isRowComplete(newGrid, activeGame.solutionGrid, r);
+    const nextColDone = isColComplete(newGrid, activeGame.solutionGrid, c);
+    const nextBoxDone = isBoxComplete(newGrid, activeGame.solutionGrid, br, bc);
+
+    let newlyCompletedUnits = 0;
+    if (!prevRowDone && nextRowDone) newlyCompletedUnits++;
+    if (!prevColDone && nextColDone) newlyCompletedUnits++;
+    if (!prevBoxDone && nextBoxDone) newlyCompletedUnits++;
+
+    let comboBonusUnits = 0;
+    if (newlyCompletedUnits === 2) comboBonusUnits = 20;
+    else if (newlyCompletedUnits === 3) comboBonusUnits = 50;
+
     const newNotes = cloneNotes(activeGame.notes);
     const prevCellNotes = Array.from(newNotes[r][c]);
-    newNotes[r][c].clear(); // clear pencil notes in solved cell
+    newNotes[r][c].clear();
 
-    // Auto-remove notes in peers if enabled in settings
+    // Section 3: Correctly placing a digit automatically removes that digit
+    // from the pencil notes of all cells in the same row, column, and 3x3 box
     const peerChanges: { row: number; col: number; removedNote: number }[] = [];
-    if (settings.autoRemoveNotes) {
-      for (const [pr, pc] of getPeers(r, c)) {
-        if (newNotes[pr][pc].has(digit)) {
-          newNotes[pr][pc].delete(digit);
-          peerChanges.push({ row: pr, col: pc, removedNote: digit });
-        }
+    for (const [pr, pc] of getPeers(r, c)) {
+      if (newNotes[pr][pc].has(digit)) {
+        newNotes[pr][pc].delete(digit);
+        peerChanges.push({ row: pr, col: pc, removedNote: digit });
       }
     }
 
@@ -408,6 +510,7 @@ export default function App() {
       ...activeGame,
       currentGrid: newGrid,
       notes: newNotes,
+      earnedComboUnits: (activeGame.earnedComboUnits || 0) + comboBonusUnits,
       undoStack: [...activeGame.undoStack, moveAction],
       redoStack: [],
     };
@@ -415,7 +518,6 @@ export default function App() {
     setActiveGame(updatedGame);
     syncStorage(history, updatedGame, settings);
 
-    // Check if puzzle is solved!
     if (checkCompletion(newGrid, activeGame.solutionGrid)) {
       handleVictory(updatedGame);
     }
@@ -439,8 +541,9 @@ export default function App() {
     if (!selectedCell) return;
 
     const [r, c] = selectedCell;
-    if (activeGame.initialGrid[r][c] !== 0) {
-      triggerTooltip([r, c], "Can't fill pre-filled box");
+
+    // Section 3: Pressing Erase on a locked cell does nothing and makes NO sound
+    if (isCellLocked(r, c, activeGame.initialGrid, activeGame.currentGrid, activeGame.solutionGrid)) {
       return;
     }
 
@@ -449,6 +552,7 @@ export default function App() {
 
     if (prevVal === 0 && prevNotes.length === 0) return;
 
+    // Section 5: Play new realistic pencil scribble sound
     sounds.playErase();
     const newGrid = cloneGrid(activeGame.currentGrid);
     newGrid[r][c] = 0;
@@ -475,7 +579,7 @@ export default function App() {
 
     setActiveGame(updatedGame);
     syncStorage(history, updatedGame, settings);
-  }, [activeGame, isLivesModalOpen, selectedCell, triggerTooltip, history, settings, syncStorage]);
+  }, [activeGame, isLivesModalOpen, selectedCell, history, settings, syncStorage]);
 
   // --- Undo Action ---
   const handleUndo = useCallback(() => {
@@ -484,15 +588,21 @@ export default function App() {
 
     const undoStack = [...activeGame.undoStack];
     const lastAction = undoStack.pop()!;
+
+    // Section 3: Correct digits cannot be undone
+    if (
+      lastAction.newVal !== 0 &&
+      lastAction.newVal === activeGame.solutionGrid[lastAction.row][lastAction.col]
+    ) {
+      return;
+    }
+
     const newGrid = cloneGrid(activeGame.currentGrid);
     const newNotes = cloneNotes(activeGame.notes);
 
-    // Revert cell value
     newGrid[lastAction.row][lastAction.col] = lastAction.prevVal;
-    // Revert cell notes
     newNotes[lastAction.row][lastAction.col] = new Set(lastAction.prevNotes);
 
-    // Revert peer notes removals if any
     if (lastAction.peerNotesChanges) {
       for (const change of lastAction.peerNotesChanges) {
         newNotes[change.row][change.col].add(change.removedNote);
@@ -504,58 +614,46 @@ export default function App() {
       currentGrid: newGrid,
       notes: newNotes,
       undoStack,
-      redoStack: [...activeGame.redoStack, lastAction],
+      redoStack: [lastAction, ...activeGame.redoStack],
     };
 
-    setSelectedCell([lastAction.row, lastAction.col]);
     setActiveGame(updatedGame);
     syncStorage(history, updatedGame, settings);
   }, [activeGame, isLivesModalOpen, history, settings, syncStorage]);
 
-  // --- Strict Cell-Specific Hint: Fill Number ---
+  // --- Hint Fill Number ---
   const handleHintFillNumber = useCallback(() => {
     if (!activeGame || activeGame.isPaused || activeGame.isCompleted || isLivesModalOpen) return;
     if (!selectedCell) {
-      triggerToast('Select a cell first');
+      triggerToast('Select an empty cell first');
       return;
     }
+
     const [r, c] = selectedCell;
-
-    if (activeGame.initialGrid[r][c] !== 0) {
-      triggerTooltip([r, c], "Can't fill pre-filled box");
-      return;
-    }
-    if (activeGame.currentGrid[r][c] !== 0) {
-      triggerTooltip([r, c], 'Block already filled');
+    if (isCellLocked(r, c, activeGame.initialGrid, activeGame.currentGrid, activeGame.solutionGrid)) {
+      triggerTooltip([r, c], "Cell is already filled");
       return;
     }
 
-    sounds.playClick();
-    const correctVal = activeGame.solutionGrid[r][c];
+    const correctNum = activeGame.solutionGrid[r][c];
     const newGrid = cloneGrid(activeGame.currentGrid);
-    newGrid[r][c] = correctVal;
+    newGrid[r][c] = correctNum;
+
+    const newHinted = cloneBoolGrid(activeGame.hintedCells);
+    newHinted[r][c] = true;
 
     const newNotes = cloneNotes(activeGame.notes);
     newNotes[r][c].clear();
-
-    const newHintedCells = cloneBoolGrid(activeGame.hintedCells);
-    newHintedCells[r][c] = true;
-
-    // Auto-remove notes in peers
-    if (settings.autoRemoveNotes) {
-      for (const [pr, pc] of getPeers(r, c)) {
-        newNotes[pr][pc].delete(correctVal);
-      }
+    for (const [pr, pc] of getPeers(r, c)) {
+      newNotes[pr][pc].delete(correctNum);
     }
 
     const updatedGame: GameState = {
       ...activeGame,
       currentGrid: newGrid,
       notes: newNotes,
-      hintedCells: newHintedCells,
+      hintedCells: newHinted,
       hintsUsed: activeGame.hintsUsed + 1,
-      undoStack: [],
-      redoStack: [],
     };
 
     setActiveGame(updatedGame);
@@ -564,42 +662,36 @@ export default function App() {
     if (checkCompletion(newGrid, activeGame.solutionGrid)) {
       handleVictory(updatedGame);
     }
-  }, [
-    activeGame,
-    isLivesModalOpen,
-    selectedCell,
-    settings,
-    triggerToast,
-    triggerTooltip,
-    history,
-    syncStorage,
-    checkCompletion,
-    handleVictory,
-  ]);
+  }, [activeGame, isLivesModalOpen, selectedCell, triggerToast, triggerTooltip, history, settings, syncStorage, checkCompletion, handleVictory]);
 
-  // --- Strict Cell-Specific Hint: Fill Possible Numbers (Candidates) ---
+  // --- Hint Fill Possibilities ---
   const handleHintFillPossibilities = useCallback(() => {
     if (!activeGame || activeGame.isPaused || activeGame.isCompleted || isLivesModalOpen) return;
     if (!selectedCell) {
-      triggerToast('Select a cell first');
+      triggerToast('Select an empty cell first');
       return;
     }
+
     const [r, c] = selectedCell;
-
-    if (activeGame.initialGrid[r][c] !== 0) {
-      triggerTooltip([r, c], "Can't fill pre-filled box");
-      return;
-    }
-    if (activeGame.currentGrid[r][c] !== 0) {
-      triggerTooltip([r, c], 'Block already filled');
+    if (isCellLocked(r, c, activeGame.initialGrid, activeGame.currentGrid, activeGame.solutionGrid)) {
+      triggerTooltip([r, c], "Cell is already filled");
       return;
     }
 
-    sounds.playNote();
-    // Computes and populates pencil candidates into that cell only
-    const candidates = getCandidates(activeGame.currentGrid, r, c);
+    const validNums = new Set<number>();
+    for (let n = 1; n <= 9; n++) {
+      let valid = true;
+      for (const [pr, pc] of getPeers(r, c)) {
+        if (activeGame.currentGrid[pr][pc] === n) {
+          valid = false;
+          break;
+        }
+      }
+      if (valid) validNums.add(n);
+    }
+
     const newNotes = cloneNotes(activeGame.notes);
-    newNotes[r][c] = candidates;
+    newNotes[r][c] = validNums;
 
     const updatedGame: GameState = {
       ...activeGame,
@@ -609,154 +701,64 @@ export default function App() {
 
     setActiveGame(updatedGame);
     syncStorage(history, updatedGame, settings);
-  }, [
-    activeGame,
-    isLivesModalOpen,
-    selectedCell,
-    triggerToast,
-    triggerTooltip,
-    history,
-    settings,
-    syncStorage,
-  ]);
+  }, [activeGame, isLivesModalOpen, selectedCell, triggerToast, triggerTooltip, history, settings, syncStorage]);
 
   // --- Toggle Pause ---
   const handleTogglePause = useCallback(() => {
     if (!activeGame || activeGame.isCompleted || isLivesModalOpen) return;
-    const isPaused = !activeGame.isPaused;
-    const updatedGame = { ...activeGame, isPaused };
-    setActiveGame(updatedGame);
-    syncStorage(history, updatedGame, settings);
+    setActiveGame(prev => {
+      if (!prev) return null;
+      const updated = {
+        ...prev,
+        isPaused: !prev.isPaused,
+      };
+      syncStorage(history, updated, settings);
+      return updated;
+    });
   }, [activeGame, isLivesModalOpen, history, settings, syncStorage]);
 
-  // --- Keyboard Shortcuts ---
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Don't capture when typing in inputs or if any modal is open
-      if (e.target instanceof HTMLInputElement || isSettingsOpen || isAnalyticsOpen || isCompletionModalOpen) {
-        return;
-      }
-
-      if (isLivesModalOpen) return;
-
-      const key = e.key;
-
-      // Digits 1-9
-      if (/^[1-9]$/.test(key)) {
-        e.preventDefault();
-        handleInputDigit(parseInt(key, 10));
-        return;
-      }
-
-      // Erase (Backspace, Delete, 0)
-      if (key === 'Backspace' || key === 'Delete' || key === '0') {
-        e.preventDefault();
-        handleErase();
-        return;
-      }
-
-      // Notes mode toggle: 'N'
-      if (key.toLowerCase() === 'n') {
-        e.preventDefault();
-        setIsNotesMode(prev => !prev);
-        return;
-      }
-
-      // Undo: U or Ctrl+Z
-      if ((e.ctrlKey || e.metaKey) && key.toLowerCase() === 'z') {
-        e.preventDefault();
-        handleUndo();
-        return;
-      }
-      if (key.toLowerCase() === 'u') {
-        e.preventDefault();
-        handleUndo();
-        return;
-      }
-
-      // Pause/Resume: Space or P
-      if (key === ' ' || key.toLowerCase() === 'p') {
-        e.preventDefault();
-        handleTogglePause();
-        return;
-      }
-
-      // Hint: H
-      if (key.toLowerCase() === 'h') {
-        e.preventDefault();
-        handleHintFillNumber();
-        return;
-      }
-
-      // Grid navigation: Arrows or WASD
-      if (selectedCell) {
-        const [r, c] = selectedCell;
-        if (key === 'ArrowUp' || key.toLowerCase() === 'w') {
-          e.preventDefault();
-          setSelectedCell([Math.max(0, r - 1), c]);
-        } else if (key === 'ArrowDown' || key.toLowerCase() === 's') {
-          e.preventDefault();
-          setSelectedCell([Math.min(8, r + 1), c]);
-        } else if (key === 'ArrowLeft' || key.toLowerCase() === 'a') {
-          e.preventDefault();
-          setSelectedCell([r, Math.max(0, c - 1)]);
-        } else if (key === 'ArrowRight' || key.toLowerCase() === 'd') {
-          e.preventDefault();
-          setSelectedCell([r, Math.min(8, c + 1)]);
-        }
-      }
-    };
-
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [
-    selectedCell,
-    handleInputDigit,
-    handleErase,
-    handleUndo,
-    handleTogglePause,
-    handleHintFillNumber,
-    isSettingsOpen,
-    isAnalyticsOpen,
-    isLivesModalOpen,
-    isCompletionModalOpen,
-  ]);
-
-  // --- Reset All Progress ---
-  const handleResetProgress = () => {
-    setHistory([]);
-    setActiveGame(null);
-    saveZenData({
+  // --- Reset Progress ---
+  const handleResetProgress = useCallback(() => {
+    saveRollbackCopy({
       version: 1,
-      history: [],
-      activeGame: null,
+      history,
+      activeGame,
       settings,
     });
+    setHistory([]);
+    setActiveGame(null);
     setCurrentView('home');
-    triggerToast('All progress reset');
-  };
-
-  const todayGames = history.filter(r => r.date === todayISO);
+    syncStorage([], null, settings);
+    setIsSettingsOpen(false);
+    triggerToast('All progress reset. Rollback copy preserved.');
+  }, [history, activeGame, settings, syncStorage, triggerToast]);
 
   return (
-    <div
-      className={`${
-        currentView === 'home'
-          ? 'min-h-screen overflow-y-auto'
-          : 'h-[100dvh] max-h-[100dvh] overflow-hidden'
-      } bg-[#f8fafc] text-[#0f172a] flex flex-col antialiased select-none`}
-      style={{
-        paddingTop: 'env(safe-area-inset-top, 0px)',
-        paddingBottom: 'env(safe-area-inset-bottom, 0px)',
-        paddingLeft: 'env(safe-area-inset-left, 0px)',
-        paddingRight: 'env(safe-area-inset-right, 0px)',
-      }}
-    >
+    <div className="w-full min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans select-none">
+      {/* Drawer menu */}
+      <MenuDrawer
+        isOpen={isMenuDrawerOpen}
+        onClose={() => setIsMenuDrawerOpen(false)}
+        currentStreak={currentStreak}
+        dailyScore={dailyScore}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenAnalytics={() => {
+          setAnalyticsInitialTab('analytics');
+          setIsAnalyticsOpen(true);
+        }}
+        onOpenHistory={() => {
+          setAnalyticsInitialTab('history');
+          setIsAnalyticsOpen(true);
+        }}
+        onGoHome={() => setCurrentView('home')}
+      />
+
+      {/* View routing: HOME vs GAME */}
       {currentView === 'home' ? (
         <>
-          {/* Top Bar for Home View */}
+          {/* Section 0: Header unchanged */}
           <Header
-            currentView={currentView}
+            currentView="home"
             onNavigateHome={() => setCurrentView('home')}
             currentStreak={currentStreak}
             dailyScore={dailyScore}
@@ -767,56 +769,43 @@ export default function App() {
             onOpenSettings={() => setIsSettingsOpen(true)}
           />
 
-          {/* Main Home Hub */}
-          <main className="flex-1 flex flex-col items-center justify-center p-2 sm:p-4 lg:p-6 w-full">
-            <HomeScreen
-              currentStreak={currentStreak}
-              bestStreak={bestStreak}
-              todayScore={dailyScore}
-              todayGames={todayGames}
-              activeGame={activeGame}
-              unlockStatus={unlockStatus}
-              onStartGame={level => startNewGame(level)}
-              onResumeActiveGame={() => setCurrentView('game')}
-            />
-          </main>
+          <HomeScreen
+            history={history}
+            currentStreak={currentStreak}
+            bestStreak={bestStreak}
+            todayScore={dailyScore}
+            todayGames={todayGames}
+            activeGame={activeGame}
+            unlockStatus={unlockStatus}
+            onStartGame={level => startNewGame(level)}
+            onResumeActiveGame={() => setCurrentView('game')}
+            onOpenPrintModal={() => setIsPrintModalOpen(true)}
+          />
         </>
       ) : (
-        /* IN-GAME VIEW: Guaranteed Fits on ONE Screen with ZERO Scrolling */
         <>
-          {/* Menu Drawer */}
-          <MenuDrawer
-            isOpen={isMenuDrawerOpen}
-            onClose={() => setIsMenuDrawerOpen(false)}
-            onOpenAnalytics={() => {
-              setAnalyticsInitialTab('analytics');
-              setIsAnalyticsOpen(true);
-            }}
-            onOpenHistory={() => {
-              setAnalyticsInitialTab('history');
-              setIsAnalyticsOpen(true);
-            }}
-            onOpenSettings={() => setIsSettingsOpen(true)}
-            onGoHome={() => setCurrentView('home')}
-            currentStreak={currentStreak}
-            dailyScore={dailyScore}
-          />
-
-          {/* 1. Compact Header: menu hamburger icon, app name, New Game button */}
+          {/* In-Game Header */}
           <InGameHeader
             onOpenMenu={() => setIsMenuDrawerOpen(true)}
             onNewGame={() => startNewGame(currentLevel)}
           />
 
-          {/* Main In-Game Viewport: Zero Scroll Flex Column */}
-          <main className="flex-1 min-h-0 flex flex-col overflow-hidden w-full">
-            {!isTwoColumn ? (
-              /* A) COMPACT LAYOUT (Default: phones, narrow screens, tablet portrait) */
-              <div className="w-full h-full flex flex-col justify-between items-center max-w-[540px] mx-auto px-2 pb-1 min-h-0">
-                {/* 2. Daily score, small and centered above stats row (single line, no big card) */}
-                <DailyScoreLine score={dailyScore} />
+          <main className="flex-1 w-full flex flex-col items-center justify-between p-2 sm:p-3 overflow-hidden">
+            {/* Loading Overlay if puzzle generation is executing */}
+            {isGenerating && (
+              <div className="absolute inset-0 bg-white/75 backdrop-blur-xs z-50 flex flex-col items-center justify-center gap-2">
+                <div className="w-8 h-8 border-3 border-blue-600 border-t-transparent animate-spin rounded-full" />
+                <span className="text-xs font-semibold text-slate-700 tracking-wide uppercase">
+                  Generating Puzzle...
+                </span>
+              </div>
+            )}
 
-                {/* 3. One slim stats row with Difficulty dropdown, Mistakes 0/3, Time + round pause button */}
+            {!isTwoColumn ? (
+              /* A) MOBILE / NARROW SCREEN LAYOUT */
+              <div className="w-full h-full flex flex-col justify-between items-center max-w-[500px] mx-auto min-h-0">
+                <LiveScoreLine score={liveScore} />
+
                 {activeGame && (
                   <SlimStatsRow
                     currentLevel={currentLevel}
@@ -831,12 +820,9 @@ export default function App() {
                   />
                 )}
 
-                {/* 4. The 9x9 grid: perfect square sized dynamically from remaining height */}
                 <div className="flex-1 min-h-0 flex items-center justify-center w-full py-1">
                   {activeGame && (
-                    <div
-                      className="w-full max-w-[min(calc(100vw-16px),calc(100dvh-215px),520px)] aspect-square flex items-center justify-center"
-                    >
+                    <div className="w-full max-w-[min(calc(100vw-16px),calc(100dvh-215px),520px)] aspect-square flex items-center justify-center">
                       <SudokuGrid
                         initialGrid={activeGame.initialGrid}
                         currentGrid={activeGame.currentGrid}
@@ -848,7 +834,6 @@ export default function App() {
                         isPaused={activeGame.isPaused}
                         onResume={handleTogglePause}
                         settings={settings}
-                        shakingCell={shakingCell}
                         tooltip={tooltip}
                         className="w-full h-full"
                       />
@@ -856,7 +841,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* 5. Row of four tool buttons directly under the grid (Undo, Erase, Notes ON/OFF, Hint badge) */}
                 {activeGame && (
                   <ToolButtonsRow
                     onUndo={handleUndo}
@@ -871,7 +855,6 @@ export default function App() {
                   />
                 )}
 
-                {/* 6. Single row of 9 number buttons directly under tools */}
                 {activeGame && (
                   <NumberPadRow
                     onInputDigit={handleInputDigit}
@@ -880,9 +863,8 @@ export default function App() {
                 )}
               </div>
             ) : (
-              /* C) LARGE SCREENS AND LANDSCAPE (Two-Column Side-by-Side Layout) */
+              /* B) DESKTOP / TABLET TWO-COLUMN LAYOUT */
               <div className="w-full h-full flex items-center justify-center gap-6 lg:gap-10 max-w-[1300px] mx-auto px-4 py-2 min-h-0">
-                {/* Left Column: Inline Difficulty tabs (if roomy) + 9x9 Grid */}
                 <div className="h-full flex flex-col items-center justify-center min-h-0">
                   {showInlineTabs && (
                     <div className="mb-2 shrink-0 self-start">
@@ -918,7 +900,6 @@ export default function App() {
                         isPaused={activeGame.isPaused}
                         onResume={handleTogglePause}
                         settings={settings}
-                        shakingCell={shakingCell}
                         tooltip={tooltip}
                         className="w-full h-full"
                       />
@@ -926,7 +907,6 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Right Column: Score, Slim Stats, Tools, 3x3 Keypad, New Game */}
                 {activeGame && (
                   <div
                     className="w-full max-w-[390px] min-w-[310px] flex flex-col justify-between min-h-0 py-1"
@@ -936,10 +916,8 @@ export default function App() {
                         : 'min(calc(100dvh - 80px), 740px, 48vw)',
                     }}
                   >
-                    {/* Score */}
-                    <DailyScoreLine score={dailyScore} />
+                    <LiveScoreLine score={liveScore} />
 
-                    {/* Slim stats row */}
                     <SlimStatsRow
                       currentLevel={currentLevel}
                       unlockStatus={unlockStatus}
@@ -952,7 +930,6 @@ export default function App() {
                       showTimer={settings.showTimer}
                     />
 
-                    {/* 4 Tool buttons */}
                     <ToolButtonsRow
                       onUndo={handleUndo}
                       canUndo={activeGame.undoStack.length > 0}
@@ -965,7 +942,6 @@ export default function App() {
                       isPaused={activeGame.isPaused}
                     />
 
-                    {/* 3x3 Keypad */}
                     <div className="py-1">
                       <Keypad3x3
                         onInputDigit={handleInputDigit}
@@ -975,7 +951,6 @@ export default function App() {
                       />
                     </div>
 
-                    {/* Prominent New Game button */}
                     <button
                       onClick={() => startNewGame(currentLevel)}
                       aria-label="Start New Game"
@@ -1010,6 +985,7 @@ export default function App() {
           const revivedGame: GameState = {
             ...activeGame,
             mistakes: 0,
+            totalMistakes: activeGame.totalMistakes ?? activeGame.mistakes,
             isPaused: false,
           };
           setActiveGame(revivedGame);
@@ -1026,7 +1002,7 @@ export default function App() {
           currentStreak={currentStreak}
           seconds={activeGame.elapsedSeconds}
           hintsUsed={activeGame.hintsUsed}
-          mistakes={activeGame.mistakes}
+          mistakes={activeGame.totalMistakes ?? activeGame.mistakes}
           onNewGame={() => startNewGame(currentLevel)}
           onGoHome={() => {
             setIsCompletionModalOpen(false);
@@ -1053,23 +1029,91 @@ export default function App() {
           syncStorage(history, activeGame, newSettings);
         }}
         onExportData={() => {
-          exportBackupJSON({
-            version: 1,
-            history,
-            activeGame,
-            settings,
-          });
+          createBackupBinary(history, settings)
+            .then(fileBytes => {
+              downloadBackupFile(fileBytes, 'zensudoku.sudokubak');
+              triggerToast('Backup downloaded');
+            })
+            .catch(err => {
+              console.error('Export error:', err);
+              triggerToast('Failed to export backup');
+            });
         }}
-        onImportData={content => {
-          const restored = importBackupJSON(content);
-          setHistory(restored.history);
-          setSettings(restored.settings);
-          if (restored.activeGame) {
-            setActiveGame(restored.activeGame);
-          }
+        onImportBackupFile={async (fileBytes: Uint8Array) => {
+          const parsed = await parseAndValidateBackup(fileBytes);
+          setPendingBackupRestore(parsed);
         }}
         onResetProgress={handleResetProgress}
+        onOpenPrintModal={() => setIsPrintModalOpen(true)}
       />
+
+      <PrintPuzzlesModal
+        isOpen={isPrintModalOpen}
+        onClose={() => setIsPrintModalOpen(false)}
+        onShowToast={triggerToast}
+      />
+
+      {/* Backup Restore Confirmation Dialog with Automatic Rollback Copy */}
+      {pendingBackupRestore && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 p-4 select-none"
+          style={{ borderRadius: '0px' }}
+        >
+          <div
+            className="w-full max-w-md bg-white border border-slate-300 shadow-2xl p-6 space-y-4"
+            style={{ borderRadius: '0px' }}
+          >
+            <h4 className="text-lg font-bold font-mono-numbers text-slate-900">
+              Restore Backup?
+            </h4>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              This will replace your current game history and settings with{' '}
+              <span className="font-bold text-slate-900">
+                {pendingBackupRestore.records.length} completed puzzle records
+              </span>
+              . An automatic rollback copy of your current data will be saved.
+            </p>
+            <div className="flex gap-2 justify-end pt-3">
+              <button
+                onClick={() => setPendingBackupRestore(null)}
+                className="px-4 py-2 bg-white border border-slate-300 text-slate-700 text-xs font-semibold hover:bg-slate-50 transition-colors cursor-pointer"
+                style={{ borderRadius: '0px' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  try {
+                    saveRollbackCopy({
+                      version: 1,
+                      history,
+                      activeGame,
+                      settings,
+                    });
+
+                    setHistory(pendingBackupRestore.records);
+                    setSettings(pendingBackupRestore.settings);
+                    setActiveGame(null);
+                    syncStorage(pendingBackupRestore.records, null, pendingBackupRestore.settings);
+
+                    setPendingBackupRestore(null);
+                    setIsSettingsOpen(false);
+                    setCurrentView('home');
+                    triggerToast('Backup restored successfully');
+                  } catch (err) {
+                    console.error('Failed to apply restore:', err);
+                    triggerToast('Failed to restore backup');
+                  }
+                }}
+                className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold transition-colors cursor-pointer"
+                style={{ borderRadius: '0px' }}
+              >
+                Confirm Restore
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -14,18 +14,6 @@
   }
 }
 
-@keyframes cellShake {
-  0%, 100% { transform: translateX(0); }
-  20% { transform: translateX(-6px); }
-  40% { transform: translateX(6px); }
-  60% { transform: translateX(-6px); }
-  80% { transform: translateX(6px); }
-}
-
-.animate-shake {
-  animation: cellShake 350ms ease-in-out;
-}
-
 /* Sharp corners guarantee */
 .sharp-corners,
 .sharp-corners * {

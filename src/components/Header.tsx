@@ -1,11 +1,11 @@
 import React from 'react';
-import { Flame, Award, BarChart2, Settings, Home } from 'lucide-react';
+import { Flame, BarChart2, Settings, Home } from 'lucide-react';
 
 interface HeaderProps {
   currentView: 'home' | 'game';
   onNavigateHome: () => void;
   currentStreak: number;
-  dailyScore: number;
+  dailyScore?: number;
   onOpenAnalytics: () => void;
   onOpenSettings: () => void;
 }
@@ -36,8 +36,8 @@ export const Header: React.FC<HeaderProps> = ({
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 font-mono-numbers">
             Zen<span className="text-blue-600">Sudoku</span>
           </h1>
-          <span className="text-xs uppercase tracking-widest text-slate-400 font-semibold hidden md:inline">
-            Offline Desktop
+          <span className="text-xs uppercase tracking-widest text-slate-400 font-semibold">
+            DESKTOP
           </span>
         </div>
       </div>
@@ -53,15 +53,6 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="text-xs text-slate-400 font-normal hidden sm:inline">streak</span>
         </div>
 
-        {/* Daily Score Indicator */}
-        <div
-          title={`Today's Cumulative Score: ${dailyScore.toLocaleString()} pts`}
-          className="flex items-center gap-1.5 px-3 py-1 bg-white border border-slate-200 text-slate-700 text-sm font-semibold shadow-xs"
-        >
-          <Award className="w-4 h-4 text-blue-600" />
-          <span className="font-mono-numbers text-blue-700">{dailyScore.toLocaleString()}</span>
-          <span className="text-xs text-slate-400 font-normal hidden sm:inline">today</span>
-        </div>
 
         {/* Analytics & Stats Button */}
         <button

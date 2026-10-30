@@ -11,7 +11,7 @@ interface AnalyticsModalProps {
   initialTab?: 'analytics' | 'history';
 }
 
-const DIFFICULTIES: Difficulty[] = ['easy', 'medium', 'hard', 'expert'];
+const DIFFICULTIES: Difficulty[] = ['easy', 'medium', 'hard', 'expert', 'master'];
 
 export const AnalyticsModal: React.FC<AnalyticsModalProps> = ({
   isOpen,
@@ -52,8 +52,9 @@ export const AnalyticsModal: React.FC<AnalyticsModalProps> = ({
         avgScore: null,
       };
     }
-    const bestTime = Math.min(...levelGames.map(g => g.seconds));
-    const avgTime = Math.round(levelGames.reduce((acc, g) => acc + g.seconds, 0) / count);
+    const getTime = (g: HistoryRecord) => g.timeSeconds ?? g.seconds ?? 0;
+    const bestTime = Math.min(...levelGames.map(getTime));
+    const avgTime = Math.round(levelGames.reduce((acc, g) => acc + getTime(g), 0) / count);
     const bestScore = Math.max(...levelGames.map(g => g.score));
     const avgScore = Math.round(levelGames.reduce((acc, g) => acc + g.score, 0) / count);
     return {
@@ -314,7 +315,7 @@ export const AnalyticsModal: React.FC<AnalyticsModalProps> = ({
                             </div>
                             <div className="flex items-center gap-4 font-mono-numbers">
                               <span className="text-slate-500">
-                                {formatSeconds(game.seconds)}
+                                {formatSeconds(game.timeSeconds ?? game.seconds ?? 0)}
                               </span>
                               <span className="font-bold text-blue-600">
                                 +{game.score} pts
@@ -349,7 +350,7 @@ export const AnalyticsModal: React.FC<AnalyticsModalProps> = ({
                           <div className="flex items-center gap-4 font-mono-numbers">
                             <span className="text-slate-500 flex items-center gap-1">
                               <Clock className="w-3 h-3 text-slate-400" />
-                              {formatSeconds(game.seconds)}
+                              {formatSeconds(game.timeSeconds ?? game.seconds ?? 0)}
                             </span>
                             <span className="font-bold text-blue-600">
                               +{game.score.toLocaleString()} pts

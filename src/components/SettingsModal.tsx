@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { X, Download, Upload, Trash2, Check } from 'lucide-react';
+import { X, Download, Upload, Trash2, Check, Printer } from 'lucide-react';
 import { UserSettings } from '../logic/sudokuLogic';
 
 interface SettingsModalProps {
@@ -8,8 +8,9 @@ interface SettingsModalProps {
   settings: UserSettings;
   onUpdateSettings: (newSettings: UserSettings) => void;
   onExportData: () => void;
-  onImportData: (fileContent: string) => void;
+  onImportBackupFile: (fileBytes: Uint8Array) => Promise<void>;
   onResetProgress: () => void;
+  onOpenPrintModal?: () => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -18,11 +19,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   settings,
   onUpdateSettings,
   onExportData,
-  onImportData,
+  onImportBackupFile,
   onResetProgress,
+  onOpenPrintModal,
 }) => {
   const [showConfirmReset, setShowConfirmReset] = useState(false);
-  const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [importStatus, setImportStatus] = useState<{ text: string; isError: boolean } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   if (!isOpen) return null;
@@ -41,22 +43,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     });
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = ev => {
-      try {
-        const content = ev.target?.result as string;
-        onImportData(content);
-        setImportStatus('Backup loaded successfully');
-        setTimeout(() => setImportStatus(null), 3000);
-      } catch (err) {
-        setImportStatus('Failed to import backup');
-        setTimeout(() => setImportStatus(null), 3000);
-      }
-    };
-    reader.readAsText(file);
+    try {
+      const buffer = await file.arrayBuffer();
+      const bytes = new Uint8Array(buffer);
+      await onImportBackupFile(bytes);
+      setImportStatus({ text: 'Backup verified and restored successfully', isError: false });
+      setTimeout(() => setImportStatus(null), 3500);
+    } catch (err: any) {
+      setImportStatus({ text: err?.message || 'Invalid or modified backup file', isError: true });
+      setTimeout(() => setImportStatus(null), 3500);
+    } finally {
+      if (e.target) e.target.value = '';
+    }
   };
 
   return (
@@ -197,10 +198,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           </div>
 
+          {/* Printables */}
+          {onOpenPrintModal && (
+            <div className="space-y-2 pt-2 border-t border-slate-100">
+              <label className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                Printables
+              </label>
+              <button
+                onClick={() => {
+                  onClose();
+                  onOpenPrintModal();
+                }}
+                className="w-full py-2.5 px-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold text-xs flex items-center justify-center gap-2 cursor-pointer transition-colors"
+                style={{ borderRadius: '0px' }}
+              >
+                <Printer className="w-4 h-4 text-slate-500" />
+                <span>Print Puzzles & Solutions (PDF)</span>
+              </button>
+            </div>
+          )}
+
           {/* Data Management */}
           <div className="space-y-3 pt-2">
             <label className="text-xs font-bold uppercase tracking-wider text-slate-500">
-              Data Management (zensudoku_data.json)
+              Compact Backup (.sudokubak)
             </label>
             <div className="grid grid-cols-2 gap-3">
               <button
@@ -209,7 +230,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 style={{ borderRadius: '0px' }}
               >
                 <Download className="w-4 h-4 text-slate-500" />
-                <span>Export JSON</span>
+                <span>Export Backup</span>
               </button>
 
               <button
@@ -218,20 +239,26 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 style={{ borderRadius: '0px' }}
               >
                 <Upload className="w-4 h-4 text-slate-500" />
-                <span>Import JSON</span>
+                <span>Import Backup</span>
               </button>
               <input
                 ref={fileInputRef}
                 type="file"
-                accept=".json,application/json"
+                accept=".sudokubak"
                 className="hidden"
                 onChange={handleFileUpload}
               />
             </div>
 
             {importStatus && (
-              <div className="p-2 bg-slate-100 text-slate-700 text-xs text-center font-medium">
-                {importStatus}
+              <div
+                className={`p-2.5 text-xs text-center font-bold tracking-wide border ${
+                  importStatus.isError
+                    ? 'bg-red-50 text-red-700 border-red-200'
+                    : 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                }`}
+              >
+                {importStatus.text}
               </div>
             )}
 

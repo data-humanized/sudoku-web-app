@@ -103,7 +103,7 @@ export const CompletionModal: React.FC<CompletionModalProps> = ({
             <div>
               <div className="text-xs text-slate-400">Mistakes</div>
               <div className="font-bold font-mono-numbers text-slate-800">
-                {mistakes}/3
+                {mistakes}
               </div>
             </div>
           </div>
